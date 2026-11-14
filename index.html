@@ -87,6 +87,10 @@ input[type=search]{font:inherit;padding:10px;border-radius:10px;border:1px solid
 .report ul{margin:0;padding-left:18px;color:var(--ink)}
 .report li{margin:3px 0}
 .report .warn{color:#b26a00}
+.revrow{display:flex;gap:10px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--line)}
+.revrow img{height:36px;max-width:55%;object-fit:contain;background:#fff;border-radius:4px}
+.revrow input{flex:1;font:inherit;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink);min-width:0}
+.grid .btn{font-size:14px;padding:11px 8px}
 .foot{font-size:12px;color:var(--muted);text-align:center;margin-top:24px}
 </style>
 </head>
@@ -95,6 +99,7 @@ input[type=search]{font:inherit;padding:10px;border-radius:10px;border:1px solid
   <div class="top">
     <div class="logo">DC</div>
     <h1>DocConvert</h1>
+    <button class="chip" id="learnBtn" title="What the app has learned">🧠</button>
     <button class="chip" id="langChip" title="OCR languages">OCR: English</button>
   </div>
   <nav id="tabs">
@@ -190,6 +195,30 @@ input[type=search]{font:inherit;padding:10px;border-radius:10px;border:1px solid
   <div class="row"><button class="btn wide" id="langDone">Done</button></div>
 </div></div>
 
+<!-- review modal -->
+<div class="modal" id="revModal"><div class="sheet">
+  <h3>Check uncertain words</h3>
+  <div class="hint">Correct any word that is wrong. The app remembers your corrections and uses them on every future document.</div>
+  <div class="langlist" id="revList"></div>
+  <div class="row"><button class="btn sec" id="revCancel">Cancel</button><span style="flex:1"></span><button class="btn" id="revSave">Save &amp; rebuild</button></div>
+</div></div>
+
+<!-- learning modal -->
+<div class="modal" id="learnModal"><div class="sheet">
+  <h3>What the app has learned</h3>
+  <div id="learnStats" class="report"></div>
+  <div class="hint">Stored only on this device. Export it to move it to another phone or the Android app.</div>
+  <div class="grid" style="margin-top:12px">
+    <button class="btn sec" id="learnExport">Export learning</button>
+    <button class="btn sec" id="learnImport">Import learning</button>
+    <button class="btn sec" id="learnProblems">Export problem log</button>
+    <button class="btn sec" id="learnPairs">Export training pairs</button>
+  </div>
+  <input type="file" id="learnFile" accept=".json,application/json" hidden>
+  <div class="msg" id="learnMsg" style="margin-top:8px"></div>
+  <div class="row"><button class="btn sec" id="learnReset">Reset learning</button><span style="flex:1"></span><button class="btn" id="learnClose">Close</button></div>
+</div></div>
+
 <!-- crop modal -->
 <div class="modal" id="cropModal"><div class="sheet" style="height:94vh">
   <h3>Adjust page</h3>
@@ -210,6 +239,7 @@ input[type=search]{font:inherit;padding:10px;border-radius:10px;border:1px solid
 </div></div>
 
 <script src="langs.js"></script>
+<script src="learn.js"></script>
 <script src="engine.js"></script>
 <script src="app.js"></script>
 <script>if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});</script>

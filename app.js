@@ -114,22 +114,83 @@ function showResult(files, hint, withReport) {
       rep.appendChild(u);
     }
   }
+  if (withReport) addReviewButton();
   $('#result').classList.add('on');
   $('#result').scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
+/* ---------------- learning: review uncertain words ---------------- */
+let lastJob = null;
+function setJob(pages, build) { lastJob = { pages, build, uncertain: pages.flatMap(p => p.uncertain || []) }; }
+function addReviewButton() {
+  if (!lastJob || !lastJob.uncertain.length) return;
+  const b = document.createElement('button'); b.className = 'btn sec wide'; b.style.marginTop = '12px';
+  b.textContent = `Review ${lastJob.uncertain.length} uncertain word${lastJob.uncertain.length > 1 ? 's' : ''} – the app learns from your corrections`;
+  b.onclick = openReview; $('#resReport').appendChild(b);
+}
+function openReview() {
+  const box = $('#revList'); box.innerHTML = '';
+  for (const u of lastJob.uncertain) {
+    const row = document.createElement('div'); row.className = 'revrow';
+    const im = document.createElement('img'); im.src = u.img; im.alt = 'word picture';
+    const inp = document.createElement('input'); inp.value = u.item.str; inp.spellcheck = false; inp.autocapitalize = 'off'; inp._u = u;
+    row.append(im, inp); box.appendChild(row);
+  }
+  $('#revModal').classList.add('on');
+}
+$('#revCancel').onclick = () => $('#revModal').classList.remove('on');
+$('#revSave').onclick = () => { $('#revModal').classList.remove('on'); const job = lastJob; if (!job) return; run(async () => {
+  let n = 0;
+  for (const inp of $$('#revList input')) {
+    const u = inp._u, v = inp.value.trim();
+    if (!v || v === u.item.str) { if (v === u.orig) Learn.learnWords([{ t: v, conf: 95 }]); continue; }
+    Learn.addCorrection(u.orig, v); Learn.addPair(u.img, v); u.item.str = v; n++;
+  }
+  // words left unchanged were right: they join the dictionary
+  prog('Rebuilding with your corrections…', 0.5);
+  for (const pm of job.pages) if (pm.kind === 'text' && pm.items) pm.lines = Engine.buildLines(pm.items, pm.w);
+  const files = await job.build();
+  job.uncertain = [];
+  lastJob = job;
+  showResult(files, n ? `Saved ${n} correction(s). The app will fix these words automatically from now on.` : 'No changes – the unchanged words were added to your dictionary.', false);
+}); };
+
+/* ---------------- learning panel ---------------- */
+function renderLearn() {
+  const s = Learn.stats();
+  $('#learnStats').innerHTML = `<ul>
+    <li><b>${s.docs}</b> document(s) processed</li>
+    <li><b>${s.corrections}</b> correction(s) you taught it</li>
+    <li><b>${s.words}</b> word(s) in your personal dictionary</li>
+    <li><b>${s.layouts}</b> document layout(s) recognised</li>
+    <li><b>${s.settings}</b> setting trials recorded (used to skip steps that don't help)</li>
+    <li><b>${s.pairs}</b> corrected word picture(s) saved for retraining</li>
+    <li><b>${s.problems}</b> problem page(s) logged</li></ul>`;
+}
+$('#learnBtn').onclick = async () => { await Learn.ready; renderLearn(); $('#learnModal').classList.add('on'); };
+$('#learnClose').onclick = () => $('#learnModal').classList.remove('on');
+$('#learnExport').onclick = e => saveFile(new Blob([Learn.exportAll()], { type: 'application/json' }), 'docconvert-learning.json', e.target);
+$('#learnProblems').onclick = e => saveFile(new Blob([Learn.exportProblems()], { type: 'application/json' }), 'docconvert-problem-log.json', e.target);
+$('#learnPairs').onclick = e => saveFile(new Blob([Learn.exportPairs()], { type: 'application/json' }), 'docconvert-training-pairs.json', e.target);
+$('#learnImport').onclick = () => $('#learnFile').click();
+$('#learnFile').onchange = async e => { const f = e.target.files[0]; e.target.value = ''; if (!f) return; try { await Learn.importAll(await f.text()); renderLearn(); $('#learnMsg').textContent = 'Learning file merged.'; } catch (err) { $('#learnMsg').textContent = err.message; } };
+$('#learnReset').onclick = async () => {
+  if ($('#learnReset').dataset.sure !== '1') { $('#learnReset').dataset.sure = '1'; $('#learnReset').textContent = 'Tap again to erase everything'; return; }
+  await Learn.reset(); $('#learnReset').dataset.sure = ''; $('#learnReset').textContent = 'Reset learning'; renderLearn(); $('#learnMsg').textContent = 'Learning erased.';
+};
+
 function toastErr(msg) {
   $('#resList').innerHTML = ''; $('#resReport').innerHTML = ''; $('#resTitle').textContent = 'Something went wrong';
   $('#resHint').textContent = msg; $('#resHint').classList.add('err');
   $('#result').classList.add('on');
 }
 async function run(fn) {
-  if (busy) return; busy = true;
+  if (busy) return; busy = true; lastJob = null;
   $$('.btn.wide').forEach(b => b.disabled = true);
   $('#result').classList.remove('on');
   prog('Starting…', 0.02);
   try { await fn(); }
   catch (e) { console.error(e); toastErr((e && e.message) || String(e)); }
-  finally { busy = false; progDone(); refreshButtons(); }
+  finally { busy = false; progDone(); refreshButtons(); try { await Learn.docDone(); } catch (e) { } }
 }
 const baseName = n => (n || 'file').replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 120) || 'file';
 
@@ -595,24 +656,29 @@ $('#fromGo').onclick = () => run(async () => {
     prog('Checking layout…', 0.92);
     const hf = mode !== 'image' ? Engine.headersFooters(pages) : {};
     prog('Writing Word file…', 0.95);
-    files = [{ name: name + '.docx', blob: await writeDocx(pages, mode, hf) }];
+    setJob(pages, async () => [{ name: name + '.docx', blob: await writeDocx(pages, mode, hf) }]);
+    files = await lastJob.build();
     hint = ocrHint(pages);
   } else if (fromFmt === 'xlsx') {
     const pages = await readPdfPages(pdf, nums, { ocr, needImage: false });
     Engine.headersFooters(pages);
     prog('Writing Excel file…', 0.93);
-    files = [{ name: name + '.xlsx', blob: await writeXlsx(pages, $('#o_xlsx').value === 'one') }];
+    const one = $('#o_xlsx').value === 'one';
+    setJob(pages, async () => [{ name: name + '.xlsx', blob: await writeXlsx(pages, one) }]);
+    files = await lastJob.build();
     hint = ocrHint(pages) + ' Columns are detected from the text positions; check merged cells.';
   } else if (fromFmt === 'pptx') {
     const mode = $('#o_pptx').value;
     const pages = await readPdfPages(pdf, nums, { ocr: ocr, needImage: mode === 'image', imgMax: 2000 });
     prog('Writing PowerPoint file…', 0.93);
-    files = [{ name: name + '.pptx', blob: await writePptx(pages, mode) }];
+    setJob(pages, async () => [{ name: name + '.pptx', blob: await writePptx(pages, mode) }]);
+    files = await lastJob.build();
     hint = mode === 'image' ? 'Each page is one slide; the page text is in the speaker notes.' : ocrHint(pages);
   } else if (fromFmt === 'txt') {
     const pages = await readPdfPages(pdf, nums, { ocr, needImage: false });
     Engine.headersFooters(pages);
-    files = [{ name: name + '.txt', blob: new Blob([pagesToText(pages)], { type: 'text/plain;charset=utf-8' }) }];
+    setJob(pages, async () => [{ name: name + '.txt', blob: new Blob([pagesToText(pages)], { type: 'text/plain;charset=utf-8' }) }]);
+    files = await lastJob.build();
     hint = ocrHint(pages);
   } else if (fromFmt === 'jpg') {
     const fmt = $('#o_img').value, dpi = +$('#o_dpi').value;
@@ -1103,8 +1169,9 @@ $('#scanGo').onclick = () => run(async () => {
     const pages = await scansToPages(cvs, scanFmt === 'docx');
     const hf = Engine.headersFooters(pages);
     prog('Writing file…', 0.95);
-    if (scanFmt === 'docx') files = [{ name: name + '.docx', blob: await writeDocx(pages, 'text', hf) }];
-    else files = [{ name: name + '.txt', blob: new Blob([pagesToText(pages)], { type: 'text/plain;charset=utf-8' }) }];
+    if (scanFmt === 'docx') setJob(pages, async () => [{ name: name + '.docx', blob: await writeDocx(pages, 'text', hf) }]);
+    else setJob(pages, async () => [{ name: name + '.txt', blob: new Blob([pagesToText(pages)], { type: 'text/plain;charset=utf-8' }) }]);
+    files = await lastJob.build();
   }
   prog('Done', 1);
   showResult(files, hint, scanFmt !== 'jpg');

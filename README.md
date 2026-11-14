@@ -15,3 +15,7 @@ Open the link in Chrome → menu ⋮ → **Add to Home screen** / **Install app*
 
 ## Built with
 pdf.js, pdf-lib, Tesseract.js, docx, docx-preview, SheetJS, PptxGenJS, pptx-preview, JSZip, html2canvas (all bundled locally, see `vendor/` and `tess/`).
+
+## Quality engine and learning
+- Every page is inspected, repaired (tilt, rotation, shadows, blur, background, split pages), read with OCR retries, cleaned and rebuilt (headings, lists, tables, header/footer) before the file is offered. A report lists what was fixed.
+- The app learns on the device: corrections you make in **Review uncertain words**, a personal dictionary, recurring document layouts, and which settings work best. Open 🧠 to see, export, import or reset what it has learned.

@@ -23,6 +23,10 @@ const Engine = (() => {
     junkLines: n => `Removed ${n} junk text line(s) (logos, handwriting, specks)`,
     junkWords: n => `Removed ${n} unreadable word(s)`,
     textFix: n => `Corrected ${n} number/web/email reading error(s)`,
+    learnedFix: n => `Applied ${n} of your earlier corrections`,
+    dictFix: n => `Fixed ${n} word(s) using your personal dictionary`,
+    layoutHit: n => `Recognised ${n} page(s) from a layout seen before – reused what worked`,
+    skipped: n => `Skipped ${n} retry step(s) that never help on this kind of page (faster)`,
     retried: n => `Re-read ${n} page(s) with different settings for a better result`,
     garbled: n => `${n} page(s) had broken embedded text – read with OCR instead`,
     ocr: n => `Read ${n} scanned page(s) with OCR`,
@@ -369,6 +373,15 @@ const Engine = (() => {
     let img = page.ocrImg, display = page.display;
     let useLangs = docLangs || langs;
     let res = await runOcr(img, useLangs, 3, opts.wantPdf); let H = harvest(res); let tries = 1;
+    const kindKey = opts.photo ? 'photo' : 'scan';
+    const L = typeof Learn !== 'undefined' ? Learn : null;
+    const sig = L ? L.signature(H.lines) : null; const lay = L ? L.layout(sig) : null;
+    let knownLangs = false, winner = 'base';
+    if (lay) {
+      note('layoutHit');
+      if (lay.langs && lay.langs.join() !== useLangs.join()) { const r2 = await runOcr(img, lay.langs, 3, opts.wantPdf); const H2 = harvest(r2); tries++; if (H2.score > H.score) { res = r2; H = H2; useLangs = lay.langs; } knownLangs = true; }
+      else if (lay.langs) knownLangs = true;
+    }
     // upright?
     if ((H.meanConf < 62 || H.chars < 40 || page.sideways) && (page.ink || 0) > 0.004) {
       const deg = await rotatedTry(img, useLangs, page.sideways);
@@ -379,7 +392,7 @@ const Engine = (() => {
     }
     // other language/script? (unreadable text, or many lines that could not be read)
     const lowRead = (H.meanConf < 50 && H.chars < 200) || (H.junkL >= 8 && H.junkL > H.lines.length * 0.6);
-    if (lowRead && (page.ink || 0) > 0.01 && (page.ink || 0) < 0.3 && page.textLike !== false && opts.allowProbe !== false) {
+    if (!knownLangs && lowRead && (page.ink || 0) > 0.01 && (page.ink || 0) < 0.3 && page.textLike !== false && opts.allowProbe !== false) {
       const nl = await scriptProbe(img, useLangs);
       if (nl.join() !== useLangs.join()) {
         useLangs = nl;
@@ -390,21 +403,27 @@ const Engine = (() => {
     }
     // alternative settings when the result is weak
     if (H.meanConf < 78 || H.junkL > Math.max(4, H.lines.length * 0.35)) {
-      const variants = [() => runOcr(binarize(img), useLangs, 3, opts.wantPdf), () => runOcr(img, useLangs, 4, opts.wantPdf)];
+      const variants = [['clean', () => runOcr(binarize(img), useLangs, 3, opts.wantPdf)], ['column', () => runOcr(img, useLangs, 4, opts.wantPdf)]];
+      const pref = lay && lay.variant; if (pref === 'column') variants.reverse();
       for (let k = 0; k < variants.length; k++) {
+        const [name, run] = variants[k];
         if (k === 1 && H.meanConf >= 65) break;
-        const r2 = await variants[k](); const H2 = harvest(r2); tries++;
-        if (H2.score > H.score * 1.05) { res = r2; H = H2; }
+        if (L && name !== pref && !L.worthTrying(kindKey, name)) { note('skipped'); continue; }
+        if (L) L.statTry(kindKey, name);
+        const r2 = await run(); const H2 = harvest(r2); tries++;
+        if (H2.score > H.score * 1.05) { res = r2; H = H2; winner = name; if (L) L.statWin(kindKey, name); }
       }
     }
     if (tries > 1) note('retried');
+    if (L && sig) L.rememberLayout(sig, { langs: useLangs.join() !== langs.join() ? useLangs : (lay && lay.langs) || null, variant: winner !== 'base' ? winner : (lay && lay.variant) || null });
+    if (L) L.learnWords(H.lines.flatMap(l => l.words));
     note('junkWords', H.junkW); note('junkLines', H.junkL);
     if (H.meanConf < 70 && H.chars > 30) flag(pageNo);
     return { H, img, display, textPdf: res.pdf };
   }
 
   /* ================= stage 4: clean text ================= */
-  function fixToken(t) {
+  function fixToken(t, conf) {
     let o = t;
     const digits = (t.match(/\d/g) || []).length, letters = (t.match(/\p{L}/gu) || []).length;
     if (digits >= 3 && digits >= letters * 2 && !/^www/i.test(t)) o = o.replace(/[Oo](?=\d|$)|(?<=\d)[Oo]/g, '0').replace(/(?<=\d)[lI|](?=\d)|^[lI|](?=\d{2})/g, '1');
@@ -412,6 +431,7 @@ const Engine = (() => {
     if (/^(https?:\/\/)?www\./i.test(o)) o = o.replace(/([a-z0-9-])(com|org|net|gov|edu|in|co)$/i, (m, a, tld) => /\.(com|org|net|gov|edu|in|co)$/i.test(o) ? m : a + '.' + tld);
     o = o.replace(/ﬁ/g, 'fi').replace(/ﬂ/g, 'fl');
     if (o !== t) note('textFix');
+    if (typeof Learn !== 'undefined') { const f = Learn.fixWord(o, conf == null ? 100 : conf); if (f.how) { note(f.how === 'correction' ? 'learnedFix' : 'dictFix'); o = f.text; } }
     return o;
   }
   function joinWords(ws) {
@@ -427,7 +447,7 @@ const Engine = (() => {
       const lh = l.bbox.y1 - l.bbox.y0, tall = lh > l.rowH * 2.2;
       for (const w of l.words) {
         const y0 = tall ? w.y0 : l.bbox.y0, h = tall ? (w.y1 - w.y0) * 1.25 : lh, sz = tall ? (w.y1 - w.y0) * 0.95 : l.rowH * 0.72;
-        items.push({ x: w.x0 / pxPerPt, top: y0 / pxPerPt, w: (w.x1 - w.x0) / pxPerPt, h: h / pxPerPt, size: Math.max(5, sz / pxPerPt), str: fixToken(w.t), conf: w.conf, para: l.para, ocr: true, li });
+        items.push({ x: w.x0 / pxPerPt, top: y0 / pxPerPt, w: (w.x1 - w.x0) / pxPerPt, h: h / pxPerPt, size: Math.max(5, sz / pxPerPt), str: fixToken(w.t, w.conf), conf: w.conf, para: l.para, ocr: true, li, src: w });
       }
     });
     return items;
@@ -517,7 +537,7 @@ const Engine = (() => {
     for (const part of parts) {
       if (part.blank) { out.push({ kind: 'blank', n: opts.pageNo, display: part.display, items: [], lines: [], w: opts.ptW || 595, h: opts.ptH || 842 }); continue; }
       if (opts.ptH) { const pd = padTo(part.display, opts.ptW / opts.ptH); part.display = pd; part.ocrImg = pd; }
-      const rd = await read(part, langs, { pageNo: opts.pageNo, wantPdf: opts.wantPdf, allowProbe: opts.allowProbe });
+      const rd = await read(part, langs, { pageNo: opts.pageNo, wantPdf: opts.wantPdf, allowProbe: opts.allowProbe, photo: opts.photo });
       let disp = rd.display;
       let pW = opts.ptW, pH = opts.ptH;
       if (pH && (disp.width > disp.height) !== (pW > pH) && Math.abs(disp.width / disp.height - pW / pH) > 0.3) [pW, pH] = [pH, pW]; // page was turned 90°
@@ -575,7 +595,22 @@ const Engine = (() => {
       const inLogo = it => { const cx = (it.x + it.w / 2) * pxPerPt, cy = (it.top + it.h / 2) * pxPerPt; return logoBoxes.some(L => cx >= L.x0 && cx <= L.x1 && cy >= L.y0 && cy <= L.y1); };
       const items2 = kind === 'picture' ? [] : items.filter(it => !inImg(it) && !inLogo(it));
       if (images.length) note('images', images.length);
-      out.push({ kind, n: opts.pageNo, w: ptW, h: ptH, display: disp, items: items2, images, ocr: true, conf: rd.H.meanConf, textPdf: rd.textPdf, ocrPx: { w: rd.img.width, h: rd.img.height } });
+      // words the reader was unsure of → offered for review (with a small picture of the word)
+      const uncertain = [];
+      if (kind === 'text') for (const it of items2) {
+        if (uncertain.length >= 40) break;
+        if (it.conf >= 82 || it.conf < 40 || it.str.length < 2 || /^[\p{P}\p{S}]+$/u.test(it.str)) continue;
+        const sw = it.src; if (!sw) continue;
+        if (typeof Learn !== 'undefined' && Learn.fixWord(sw.t, 0).how === 'correction') continue; // already taught
+        const pad = 6, cx = Math.max(0, sw.x0 - pad), cy = Math.max(0, sw.y0 - pad), cw = Math.min(rd.img.width - cx, sw.x1 - sw.x0 + 2 * pad), ch = Math.min(rd.img.height - cy, sw.y1 - sw.y0 + 2 * pad);
+        if (cw < 6 || ch < 6) continue;
+        const k = Math.min(1, 48 / ch); const c = scaled(crop(rd.img, cx, cy, cw, ch), cw * k, ch * k);
+        uncertain.push({ item: it, orig: it.str, conf: Math.round(it.conf), img: c.toDataURL('image/jpeg', 0.8) });
+      }
+      for (const it of items2) delete it.src;
+      if (typeof Learn !== 'undefined' && (R && R.flagged.has(opts.pageNo) || kind === 'picture' && rd.H.chars > 60))
+        Learn.logProblem({ page: opts.pageNo, kind, conf: Math.round(rd.H.meanConf), chars: rd.H.chars, junkLines: rd.H.junkL, blurry: !!part.blurry, angle: part.angle || 0, ink: +(part.ink || 0).toFixed(3), textArea: +textArea.toFixed(3), picArea: +picArea.toFixed(3) });
+      out.push({ uncertain, kind, n: opts.pageNo, w: ptW, h: ptH, display: disp, items: items2, images, ocr: true, conf: rd.H.meanConf, textPdf: rd.textPdf, ocrPx: { w: rd.img.width, h: rd.img.height } });
       note('ocr');
     }
     return out;
