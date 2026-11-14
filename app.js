@@ -118,6 +118,47 @@ function showResult(files, hint, withReport) {
   $('#result').classList.add('on');
   $('#result').scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
+/* ---------------- sharing with your other devices ---------------- */
+async function aiOption() {
+  if (typeof Sync === 'undefined' || Sync.Helper.mode() === 'off' || !Sync.Helper.url()) return null;
+  prog('Checking the laptop helper…', null);
+  if (!(await Sync.Helper.available())) return null;
+  return { mode: Sync.Helper.mode(), vision: (blob, hint) => Sync.Helper.vision(blob, hint) };
+}
+async function backgroundSync() {
+  try { const done = await Sync.syncAll(); if (done.length) console.log('synced with', done.join(', ')); } catch (e) { console.warn('sync', e); }
+}
+function renderShare() {
+  const D = Sync.Drive, H = Sync.Helper;
+  $('#gClient').value = Sync.cfg.get('clientId', '') || '';
+  $('#hUrl').value = H.url(); $('#hKey').value = H.key(); $('#hMode').value = H.mode();
+  $('#gState').textContent = !D.clientId() ? 'Not set up' : D.hasToken() ? 'Signed in' : D.linked() ? 'Linked – tap Sync now to sign in again' : 'Not signed in';
+  const ls = Sync.lastSync(); $('#syncState').textContent = ls ? 'Last sync: ' + new Date(ls).toLocaleString() : 'Never synced';
+}
+$('#gClient').onchange = e => { Sync.cfg.set('clientId', e.target.value.trim()); renderShare(); };
+$('#hUrl').onchange = e => { Sync.cfg.set('helperUrl', e.target.value.trim()); };
+$('#hKey').onchange = e => { Sync.cfg.set('helperKey', e.target.value.trim()); };
+$('#hMode').onchange = e => { Sync.cfg.set('aiMode', e.target.value); };
+$('#gSign').onclick = async () => {
+  $('#shareMsg').textContent = 'Opening Google sign-in…';
+  try { await Sync.Drive.signIn(); $('#shareMsg').textContent = 'Signed in. Syncing…'; const d = await Sync.syncAll(); $('#shareMsg').textContent = 'Synced with ' + (d.join(' and ') || 'nothing') + '.'; renderLearn(); }
+  catch (e) { $('#shareMsg').textContent = e.message; }
+  renderShare();
+};
+$('#gOut').onclick = () => { Sync.Drive.signOut(); renderShare(); $('#shareMsg').textContent = 'Google Drive sync turned off on this device.'; };
+$('#hTest').onclick = async () => {
+  Sync.cfg.set('helperUrl', $('#hUrl').value.trim()); Sync.cfg.set('helperKey', $('#hKey').value.trim());
+  $('#shareMsg').textContent = 'Contacting the laptop…';
+  const ok = await Sync.Helper.available(true); const inf = Sync.Helper.info() || {};
+  $('#shareMsg').textContent = ok ? `Laptop helper connected. Vision AI: ${inf.model || 'not ready – ' + (inf.modelError || 'unknown')}.` : 'Could not reach the laptop helper: ' + (inf.error || 'no answer') + '. Check that it is running and Tailscale is on.';
+};
+$('#syncNow').onclick = async () => {
+  $('#shareMsg').textContent = 'Syncing…';
+  try { const d = await Sync.syncAll({ interactive: true }); $('#shareMsg').textContent = d.length ? 'Synced with ' + d.join(' and ') + '.' : 'Nothing to sync with yet – set up Google Drive or the laptop helper.'; renderLearn(); }
+  catch (e) { $('#shareMsg').textContent = e.message; }
+  renderShare();
+};
+
 /* ---------------- learning: review uncertain words ---------------- */
 let lastJob = null;
 function setJob(pages, build) { lastJob = { pages, build, uncertain: pages.flatMap(p => p.uncertain || []) }; }
@@ -166,7 +207,7 @@ function renderLearn() {
     <li><b>${s.pairs}</b> corrected word picture(s) saved for retraining</li>
     <li><b>${s.problems}</b> problem page(s) logged</li></ul>`;
 }
-$('#learnBtn').onclick = async () => { await Learn.ready; renderLearn(); $('#learnModal').classList.add('on'); };
+$('#learnBtn').onclick = async () => { await Learn.ready; renderLearn(); renderShare(); $('#learnModal').classList.add('on'); };
 $('#learnClose').onclick = () => $('#learnModal').classList.remove('on');
 $('#learnExport').onclick = e => saveFile(new Blob([Learn.exportAll()], { type: 'application/json' }), 'docconvert-learning.json', e.target);
 $('#learnProblems').onclick = e => saveFile(new Blob([Learn.exportProblems()], { type: 'application/json' }), 'docconvert-problem-log.json', e.target);
@@ -190,7 +231,7 @@ async function run(fn) {
   prog('Starting…', 0.02);
   try { await fn(); }
   catch (e) { console.error(e); toastErr((e && e.message) || String(e)); }
-  finally { busy = false; progDone(); refreshButtons(); try { await Learn.docDone(); } catch (e) { } }
+  finally { busy = false; progDone(); refreshButtons(); try { await Learn.docDone(); } catch (e) { } backgroundSync(); }
 }
 const baseName = n => (n || 'file').replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]+/g, '_').slice(0, 120) || 'file';
 
@@ -318,7 +359,7 @@ function parseRange(str, n) {
   return [...set].sort((a, b) => a - b);
 }
 /* Read a PDF into page models via the quality engine */
-async function readPdfPages(pdf, pageNums, { ocr, needImage, imgMax = 2000, label = 'Reading', regions = false }) {
+async function readPdfPages(pdf, pageNums, { ocr, needImage, imgMax = 2000, label = 'Reading', regions = false, ai = null }) {
   const out = [];
   for (let k = 0; k < pageNums.length; k++) {
     const n = pageNums[k];
@@ -333,7 +374,7 @@ async function readPdfPages(pdf, pageNums, { ocr, needImage, imgMax = 2000, labe
       prog(`Page ${n}: repairing the image…`, base);
       const { cv } = await renderPage(page, 3400, Math.min(4, 2400 / t.w));
       prog(`Page ${n}: reading text…`, base + 0.3 / pageNums.length);
-      const pms = await Engine.processScanned(cv, { langs: ocrLangs, pageNo: n, photo: true, allowSplit: t.w > t.h * 1.15, ptW: t.w, ptH: t.h, wantRegions: regions, targetW: 2400, lowRes: false });
+      const pms = await Engine.processScanned(cv, { langs: ocrLangs, pageNo: n, photo: true, allowSplit: t.w > t.h * 1.15, ptW: t.w, ptH: t.h, wantRegions: regions, targetW: 2400, lowRes: false, ai });
       for (const pm of pms) {
         pm.lines = pm.kind === 'text' ? Engine.buildLines(pm.items, pm.w) : [];
         pm.rules = pm.kind === 'text' ? Engine.rulings(pm.display, pm.display.width / pm.w) : [];
@@ -584,10 +625,10 @@ async function buildScanPdf(cvs, place, { ocr, photo, allowSplit, label = 'Build
 }
 /* scans → page models for Word/Text */
 async function scansToPages(cvs, wantRegions) {
-  const pages = [];
+  const pages = []; const ai = await aiOption();
   for (let i = 0; i < cvs.length; i++) {
     prog(`Page ${i + 1} of ${cvs.length}: repairing and reading…`, 0.08 + 0.85 * i / cvs.length);
-    const pms = await Engine.processScanned(cvs[i], { langs: ocrLangs, pageNo: i + 1, photo: false, allowSplit: true, ptW: 595.28, ptH: 841.89, wantRegions, targetW: 2400 });
+    const pms = await Engine.processScanned(cvs[i], { langs: ocrLangs, pageNo: i + 1, photo: false, allowSplit: true, ptW: 595.28, ptH: 841.89, wantRegions, targetW: 2400, ai });
     for (const pm of pms) {
       pm.lines = pm.kind === 'text' ? Engine.buildLines(pm.items, pm.w) : [];
       pm.rules = pm.kind === 'text' ? Engine.rulings(pm.display, pm.display.width / pm.w) : [];
@@ -652,7 +693,7 @@ $('#fromGo').onclick = () => run(async () => {
   let files = [], hint = '';
   if (fromFmt === 'docx') {
     const mode = $('#o_docx').value;
-    const pages = await readPdfPages(pdf, nums, { ocr: ocr && mode !== 'image', needImage: mode !== 'text', imgMax: 1800, regions: mode !== 'image' });
+    const pages = await readPdfPages(pdf, nums, { ocr: ocr && mode !== 'image', needImage: mode !== 'text', imgMax: 1800, regions: mode !== 'image', ai: mode !== 'image' ? await aiOption() : null });
     prog('Checking layout…', 0.92);
     const hf = mode !== 'image' ? Engine.headersFooters(pages) : {};
     prog('Writing Word file…', 0.95);
@@ -675,7 +716,7 @@ $('#fromGo').onclick = () => run(async () => {
     files = await lastJob.build();
     hint = mode === 'image' ? 'Each page is one slide; the page text is in the speaker notes.' : ocrHint(pages);
   } else if (fromFmt === 'txt') {
-    const pages = await readPdfPages(pdf, nums, { ocr, needImage: false });
+    const pages = await readPdfPages(pdf, nums, { ocr, needImage: false, ai: await aiOption() });
     Engine.headersFooters(pages);
     setJob(pages, async () => [{ name: name + '.txt', blob: new Blob([pagesToText(pages)], { type: 'text/plain;charset=utf-8' }) }]);
     files = await lastJob.build();

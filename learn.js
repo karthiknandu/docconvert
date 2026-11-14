@@ -4,7 +4,7 @@
 'use strict';
 const Learn = (() => {
   const KEY = 'dc_learn_v1';
-  const blank = () => ({ v: 1, corrections: {}, dict: {}, layouts: {}, stats: {}, problems: [], docs: 0, pairs: [] });
+  const blank = () => ({ v: 1, corrections: {}, dict: {}, layouts: {}, stats: {}, problems: [], docs: 0, pairs: [], model: null });
   let M = blank();
   let dirty = false;
 
@@ -63,7 +63,7 @@ const Learn = (() => {
   function fixWord(t, conf) {
     if (!t) return { text: t, how: null };
     const c = M.corrections[t];
-    if (c && c.n >= 1) return { text: c.to, how: 'correction' };
+    if (c && (c.n >= 1 || (c.a || 0) >= 2)) return { text: c.to, how: 'correction' };
     if (conf >= 82) return { text: t, how: null };
     const core = strip(t); if (core.length < 4 || /\d/.test(core)) return { text: t, how: null };
     const low = core.toLowerCase();
@@ -81,9 +81,13 @@ const Learn = (() => {
     if (core === core.toUpperCase()) fixed = best.toUpperCase(); else if (core[0] === core[0].toUpperCase()) fixed = best[0].toUpperCase() + best.slice(1);
     return { text: t.replace(core, fixed), how: 'dictionary' };
   }
-  function addCorrection(from, to) {
+  /* auto = learned from the laptop AI; it only takes effect after it has been seen twice (you: at once) */
+  function addCorrection(from, to, auto = false) {
     if (!from || from === to) return;
-    const c = M.corrections[from] || { to, n: 0 }; c.to = to; c.n++; M.corrections[from] = c;
+    const c = M.corrections[from] || { to, n: 0, a: 0 };
+    if (auto) { if (c.n > 0 && c.to !== to) return; c.a = (c.to === to ? (c.a || 0) : 0) + 1; c.to = to; }
+    else { c.to = to; c.n++; }
+    c.t = Date.now(); M.corrections[from] = c;
     for (const w of to.split(/\s+/)) { const k = strip(w).toLowerCase(); if (k.length >= 3 && !/\d/.test(k)) M.dict[k] = (M.dict[k] || 0) + 3; }
     dictIndex = null; dirty = true;
   }
@@ -96,7 +100,7 @@ const Learn = (() => {
     }
     if (n) { dictIndex = null; dirty = true; }
   }
-  function addPair(imgDataUrl, text) { M.pairs.push({ img: imgDataUrl, text, d: Date.now() }); dirty = true; }
+  function addPair(imgDataUrl, text, src = 'you') { M.pairs.push({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8), img: imgDataUrl, text, src, d: Date.now() }); dirty = true; }
 
   /* ---------- 3: recurring layouts ---------- */
   function signature(lines) {
@@ -122,7 +126,8 @@ const Learn = (() => {
   }
 
   /* ---------- 5: problem log ---------- */
-  function logProblem(p) { M.problems.push({ d: new Date().toISOString().slice(0, 10), ...p }); dirty = true; }
+  const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  function logProblem(p) { M.problems.push({ id: uid(), d: new Date().toISOString().slice(0, 10), ...p }); dirty = true; }
 
   function stats() {
     return {
@@ -136,18 +141,35 @@ const Learn = (() => {
     return JSON.stringify({ app: 'DocConvert', exported: new Date().toISOString(), note: 'Content-free problem log: page measurements only, no document text.', problems: M.problems, stats: M.stats }, null, 1);
   }
   function exportPairs() { return JSON.stringify({ app: 'DocConvert', note: 'Corrected word images + text, for retraining an OCR model on a PC.', pairs: M.pairs }); }
-  function importAll(json) {
-    const o = JSON.parse(json); if (!o || o.v !== 1) throw new Error('This is not a DocConvert learning file.');
-    const cur = M; M = Object.assign(blank(), o);
-    // merge rather than replace
-    for (const [k, v] of Object.entries(cur.dict)) M.dict[k] = Math.max(M.dict[k] || 0, v);
-    for (const [k, v] of Object.entries(cur.corrections)) if (!M.corrections[k]) M.corrections[k] = v;
-    for (const [k, v] of Object.entries(cur.layouts)) if (!M.layouts[k]) M.layouts[k] = v;
-    M.problems = [...cur.problems, ...M.problems]; M.pairs = [...cur.pairs, ...M.pairs];
-    dictIndex = null; dirty = true; return save();
+  /* two-way merge of another device's learning into this one (safe to repeat) */
+  function merge(o) {
+    if (!o || o.v !== 1) throw new Error('This is not a DocConvert learning file.');
+    for (const [k, v] of Object.entries(o.dict || {})) M.dict[k] = Math.max(M.dict[k] || 0, v);
+    for (const [k, v] of Object.entries(o.corrections || {})) { const c = M.corrections[k]; if (!c || (v.t || 0) > (c.t || 0)) M.corrections[k] = v; else if (c.to === v.to) { c.n = Math.max(c.n || 0, v.n || 0); c.a = Math.max(c.a || 0, v.a || 0); } }
+    for (const [k, v] of Object.entries(o.layouts || {})) { const c = M.layouts[k]; if (!c || (v.d || 0) > (c.d || 0)) M.layouts[k] = { ...v, n: Math.max(v.n || 0, (c && c.n) || 0) }; }
+    for (const [kind, st] of Object.entries(o.stats || {})) { const c = M.stats[kind] || (M.stats[kind] = {}); for (const [k, v] of Object.entries(st)) c[k] = Math.max(c[k] || 0, v); }
+    const have = new Set(M.problems.map(p => p.id)); for (const p of o.problems || []) if (p.id && !have.has(p.id)) M.problems.push(p);
+    const hp = new Set(M.pairs.map(p => p.id)); for (const p of o.pairs || []) if (p.id && !hp.has(p.id)) M.pairs.push(p);
+    M.docs = Math.max(M.docs, o.docs || 0);
+    if (o.model && (!M.model || (o.model.d || 0) > (M.model.d || 0))) M.model = o.model;
+    dictIndex = null; dirty = true;
+  }
+  function importAll(json) { merge(JSON.parse(json)); return save(); }
+  /* sync with a remote store: backend = { get(): Promise<string|null>, put(json): Promise } */
+  async function syncWith(backend) {
+    await ready;
+    const remote = await backend.get();
+    if (remote) merge(JSON.parse(remote));
+    // give old local entries ids so they merge cleanly next time
+    for (const p of M.problems) if (!p.id) p.id = uid();
+    for (const p of M.pairs) if (!p.id) p.id = uid();
+    dirty = true; await save();
+    await backend.put(JSON.stringify(M));
+    M.lastSync = Date.now();
+    return stats();
   }
   function reset() { M = blank(); dictIndex = null; dirty = true; return save(); }
   function docDone() { M.docs++; dirty = true; return save(); }
 
-  return { ready, save, fixWord, addCorrection, learnWords, addPair, signature, layout, rememberLayout, statWin, statTry, worthTrying, logProblem, stats, exportAll, exportProblems, exportPairs, importAll, reset, docDone };
+  return { ready, save, merge, syncWith, data: () => M, fixWord, addCorrection, learnWords, addPair, signature, layout, rememberLayout, statWin, statTry, worthTrying, logProblem, stats, exportAll, exportProblems, exportPairs, importAll, reset, docDone };
 })();

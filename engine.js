@@ -31,6 +31,9 @@ const Engine = (() => {
     garbled: n => `${n} page(s) had broken embedded text – read with OCR instead`,
     ocr: n => `Read ${n} scanned page(s) with OCR`,
     reread: n => `Read ${n} boxed table/text area(s) separately so nothing is missed`,
+    ai: n => `Read ${n} hard page(s) with the laptop AI`,
+    aiTaught: n => `The laptop AI taught the phone ${n} word correction(s)`,
+    aiFail: n => `Laptop AI could not be used for ${n} page(s) – used the phone's own reading`,
     tables: n => `Rebuilt ${n} table(s)`,
     fakeTables: n => `Ignored ${n} false table(s)`,
     headerFooter: n => `Moved repeated header/footer text out of ${n} page(s)`,
@@ -483,6 +486,55 @@ const Engine = (() => {
     return regs;
   }
 
+  /* Markdown from the laptop AI → layout blocks */
+  function mdToBlocks(md) {
+    const out = []; let table = null;
+    const clean = t => t.replace(/\*\*|__|`/g, '').replace(/\s+/g, ' ').trim();
+    for (const raw of md.replace(/\r/g, '').split('\n')) {
+      const line = raw.trim();
+      if (/^\|/.test(line)) {
+        if (/^[|\s:\-]+$/.test(line) && line.includes('-')) continue; // separator row
+        const cells = line.replace(/^\||\|$/g, '').split('|').map(clean);
+        if (!table) { table = { type: 'table', rows: [] }; out.push(table); }
+        table.rows.push(cells); continue;
+      }
+      table = null;
+      if (!line) { out.push({ type: 'gap' }); continue; }
+      let m;
+      if ((m = line.match(/^(#{1,6})\s+(.*)$/))) { out.push({ type: 'p', text: clean(m[2]), head: m[1].length === 1 ? 1 : 2, nlines: 1 }); continue; }
+      if ((m = line.match(/^[-*•]\s+(.*)$/))) { out.push({ type: 'p', text: clean(m[1]), list: 'bullet', nlines: 1 }); continue; }
+      if ((m = line.match(/^(\d{1,3}[.)])\s+(.*)$/))) { out.push({ type: 'p', text: m[1] + ' ' + clean(m[2]), list: 'num', nlines: 1 }); continue; }
+      const t = clean(line); const lm = line.match(/^\*\*([^*]{1,60}?[:：]?)\*\*\s*/);
+      const prev = out[out.length - 1];
+      if (!lm && prev && prev.type === 'p' && !prev.head && !prev.list && !prev.label && /^\p{Ll}/u.test(t) && !/[:.]$/.test(prev.text)) { prev.text += ' ' + t; continue; }
+      const b = { type: 'p', text: t, nlines: 1 };
+      if (lm) { const lab = clean(lm[1]); b.label = Math.min(t.length, lab.length + (/[:：]$/.test(lab) ? 1 : 0)); }
+      out.push(b);
+    }
+    for (const b of out) if (b.type === 'table') { const n = Math.max(...b.rows.map(r => r.length)); b.rows = b.rows.map(r => r.concat(new Array(n - r.length).fill(''))); }
+    return out.filter(b => b.type !== 'gap');
+  }
+  /* the AI's reading teaches the on-device OCR: dictionary words + (after two sightings) word corrections */
+  function teach(md, uncertain) {
+    if (typeof Learn === 'undefined') return;
+    const toks = (md.replace(/[|*#`_]/g, ' ').match(/[\p{L}\p{N}][\p{L}\p{N}.,'’\-\/]*/gu) || []).map(t => t.replace(/[.,]+$/, ''));
+    Learn.learnWords(toks.map(t => ({ t, conf: 95 })));
+    const uniq = [...new Set(toks)];
+    let n = 0;
+    for (const u of uncertain) {
+      const o = u.orig.replace(/[^\p{L}\p{N}]+$/u, ''); if (o.length < 3 || uniq.includes(o)) continue;
+      const max = o.length >= 8 ? 2 : 1;
+      const near = uniq.filter(t => Math.abs(t.length - o.length) <= max && levD(o.toLowerCase(), t.toLowerCase(), max) <= max);
+      if (near.length === 1 && near[0] !== o) { Learn.addCorrection(o, near[0], true); Learn.addPair(u.img, near[0], 'ai'); n++; }
+    }
+    if (n) note('aiTaught', n);
+  }
+  function levD(a, b, max) {
+    let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) { const cur = [i]; for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); if (Math.min(...cur) > max) return max + 1; prev = cur; }
+    return prev[b.length];
+  }
+
   /* coloured ink (logos, stamps, signatures in blue pen) that is not readable text → picture */
   function findLogos(disp, H) {
     const P = probe(disp, 600); const s = P.s, W = P.w, Hh = P.h;
@@ -610,7 +662,25 @@ const Engine = (() => {
       for (const it of items2) delete it.src;
       if (typeof Learn !== 'undefined' && (R && R.flagged.has(opts.pageNo) || kind === 'picture' && rd.H.chars > 60))
         Learn.logProblem({ page: opts.pageNo, kind, conf: Math.round(rd.H.meanConf), chars: rd.H.chars, junkLines: rd.H.junkL, blurry: !!part.blurry, angle: part.angle || 0, ink: +(part.ink || 0).toFixed(3), textArea: +textArea.toFixed(3), picArea: +picArea.toFixed(3) });
-      out.push({ uncertain, kind, n: opts.pageNo, w: ptW, h: ptH, display: disp, items: items2, images, ocr: true, conf: rd.H.meanConf, textPdf: rd.textPdf, ocrPx: { w: rd.img.width, h: rd.img.height } });
+      // laptop AI for hard pages (or all pages if chosen) – also teaches the on-device OCR
+      let aiBlocks = null;
+      if (kind === 'text' && opts.ai) {
+        const hard = (R && R.flagged.has(opts.pageNo)) || rd.H.meanConf < 78 || rd.H.junkL > Math.max(3, rd.H.lines.length * 0.3);
+        if (opts.ai.mode === 'all' || hard) {
+          try {
+            if (typeof prog === 'function') prog(`Page ${opts.pageNo}: reading with the laptop AI…`, null);
+            const s = Math.min(1, 1600 / Math.max(disp.width, disp.height));
+            const blob = await new Promise(r => scaled(disp, disp.width * s, disp.height * s).toBlob(r, 'image/jpeg', 0.9));
+            const md = await opts.ai.vision(blob, (opts.langs || []).map(l => typeof langName === 'function' ? langName(l) : l).join(', '));
+            if (md && md.replace(/\s/g, '').length > Math.min(40, rd.H.chars * 0.3)) {
+              aiBlocks = mdToBlocks(md); note('ai');
+              teach(md, uncertain);
+              uncertain.length = 0;
+            }
+          } catch (e) { note('aiFail'); console.warn('laptop AI failed', e); }
+        }
+      }
+      out.push({ aiBlocks, uncertain, kind, n: opts.pageNo, w: ptW, h: ptH, display: disp, items: items2, images, ocr: true, conf: rd.H.meanConf, textPdf: rd.textPdf, ocrPx: { w: rd.img.width, h: rd.img.height } });
       note('ocr');
     }
     return out;
@@ -768,6 +838,10 @@ const Engine = (() => {
     const lines = pm.lines || [];
     const blocks = [];
     if (pm.kind === 'picture' || pm.kind === 'blank') return blocks;
+    if (pm.aiBlocks) {
+      const ims = (pm.images || []).map(im => ({ type: 'image', ...im }));
+      return [...ims.filter(i => i.top < pm.h * 0.3), ...pm.aiBlocks.map(b => ({ ...b })), ...ims.filter(i => i.top >= pm.h * 0.3)];
+    }
     const sizes = lines.flatMap(L => L.items.map(() => L.size));
     const body = median(sizes) || 11;
     const left = lines.length ? median(lines.map(L => L.x)) : 0;
@@ -853,5 +927,5 @@ const Engine = (() => {
     return s;
   }
 
-  return { bodySize, resetReport, reportLines, flaggedPages, note, flag, repair, read, processScanned, garbled, buildLines, layout, headersFooters, rulings, fitScale, grid, pictureRegions, toItems, setDocLangs: l => { docLangs = l; }, worker };
+  return { mdToBlocks, bodySize, resetReport, reportLines, flaggedPages, note, flag, repair, read, processScanned, garbled, buildLines, layout, headersFooters, rulings, fitScale, grid, pictureRegions, toItems, setDocLangs: l => { docLangs = l; }, worker };
 })();
