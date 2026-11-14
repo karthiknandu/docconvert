@@ -176,10 +176,10 @@ function openReview() {
     const inp = document.createElement('input'); inp.value = u.item.str; inp.spellcheck = false; inp.autocapitalize = 'off'; inp._u = u;
     row.append(im, inp); box.appendChild(row);
   }
-  $('#revModal').classList.add('on');
+  openModal('revModal');
 }
-$('#revCancel').onclick = () => $('#revModal').classList.remove('on');
-$('#revSave').onclick = () => { $('#revModal').classList.remove('on'); const job = lastJob; if (!job) return; run(async () => {
+$('#revCancel').onclick = () => closeModal('revModal');
+$('#revSave').onclick = () => { closeModal('revModal'); const job = lastJob; if (!job) return; run(async () => {
   let n = 0;
   for (const inp of $$('#revList input')) {
     const u = inp._u, v = inp.value.trim();
@@ -207,8 +207,8 @@ function renderLearn() {
     <li><b>${s.pairs}</b> corrected word picture(s) saved for retraining</li>
     <li><b>${s.problems}</b> problem page(s) logged</li></ul>`;
 }
-$('#learnBtn').onclick = async () => { await Learn.ready; renderLearn(); renderShare(); $('#learnModal').classList.add('on'); };
-$('#learnClose').onclick = () => $('#learnModal').classList.remove('on');
+$('#learnBtn').onclick = async () => { await Learn.ready; renderLearn(); renderShare(); openModal('learnModal'); };
+$('#learnClose').onclick = () => closeModal('learnModal');
 $('#learnExport').onclick = e => saveFile(new Blob([Learn.exportAll()], { type: 'application/json' }), 'docconvert-learning.json', e.target);
 $('#learnProblems').onclick = e => saveFile(new Blob([Learn.exportProblems()], { type: 'application/json' }), 'docconvert-problem-log.json', e.target);
 $('#learnPairs').onclick = e => saveFile(new Blob([Learn.exportPairs()], { type: 'application/json' }), 'docconvert-training-pairs.json', e.target);
@@ -226,7 +226,7 @@ function toastErr(msg) {
 }
 async function run(fn) {
   if (busy) return; busy = true; lastJob = null;
-  $$('.btn.wide').forEach(b => b.disabled = true);
+  ['#fromGo', '#toGo', '#scanGo'].forEach(id => $(id).disabled = true);
   $('#result').classList.remove('on');
   prog('Starting…', 0.02);
   try { await fn(); }
@@ -250,6 +250,27 @@ function pickGroup(sel, cb) {
   });
 }
 
+/* ---------------- pop-up pages: ✕, tap outside, phone back button ---------------- */
+const modalStack = [];
+function openModal(id) {
+  const m = $('#' + id); if (m.classList.contains('on')) return;
+  m.classList.add('on'); modalStack.push(id);
+  try { history.pushState({ modal: id }, ''); } catch (e) { }
+}
+function closeModal(id, fromBack) {
+  const m = $('#' + id); if (!m || !m.classList.contains('on')) return;
+  m.classList.remove('on');
+  const i = modalStack.lastIndexOf(id); if (i >= 0) modalStack.splice(i, 1);
+  if (id === 'langModal') store.set('langs', ocrLangs);
+  if (!fromBack) { try { if (history.state && history.state.modal === id) history.back(); } catch (e) { } }
+}
+window.addEventListener('popstate', () => { const id = modalStack[modalStack.length - 1]; if (id) closeModal(id, true); });
+$$('.modal').forEach(m => {
+  m.addEventListener('click', e => { if (e.target === m) closeModal(m.id); });
+  const sh = $('.sheet', m); const x = document.createElement('button'); x.className = 'xclose'; x.setAttribute('aria-label', 'Close'); x.textContent = '✕';
+  x.onclick = () => closeModal(m.id); sh.prepend(x);
+});
+
 /* ---------------- OCR languages ---------------- */
 let ocrLangs = store.get('langs', ['eng']).filter(c => LANGS.some(l => l[0] === c));
 if (!ocrLangs.length) ocrLangs = ['eng'];
@@ -265,7 +286,7 @@ function renderLangList(q) {
     const lb = document.createElement('label');
     const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = ocrLangs.includes(code);
     cb.onchange = () => {
-      if (cb.checked) { if (ocrLangs.length >= 3) { cb.checked = false; return; } ocrLangs.push(code); }
+      if (cb.checked) ocrLangs.push(code);
       else { ocrLangs = ocrLangs.filter(c => c !== code); if (!ocrLangs.length) { ocrLangs = [code]; cb.checked = true; } }
       updateLangChip();
     };
@@ -273,9 +294,9 @@ function renderLangList(q) {
     box.appendChild(lb);
   }
 }
-$('#langChip').onclick = () => { $('#langSearch').value = ''; renderLangList(''); $('#langModal').classList.add('on'); };
+$('#langChip').onclick = () => { $('#langSearch').value = ''; renderLangList(''); openModal('langModal'); };
 $('#langSearch').oninput = e => renderLangList(e.target.value);
-$('#langDone').onclick = () => { $('#langModal').classList.remove('on'); store.set('langs', ocrLangs); };
+$('#langDone').onclick = () => closeModal('langModal');
 
 async function getOcr() {
   prog('Starting OCR engine (' + ocrLangs.map(langName).join(', ') + ')…', null);
@@ -359,27 +380,33 @@ function parseRange(str, n) {
   return [...set].sort((a, b) => a - b);
 }
 /* Read a PDF into page models via the quality engine */
+/* run fn over items, n at a time, results in the original order */
+async function parallelMap(items, n, fn) {
+  const out = new Array(items.length); let next = 0;
+  const lane = async () => { while (next < items.length) { const k = next++; out[k] = await fn(items[k], k); } };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(n, items.length)) }, lane));
+  return out;
+}
+/* Read a PDF into page models via the quality engine – several pages at once */
 async function readPdfPages(pdf, pageNums, { ocr, needImage, imgMax = 2000, label = 'Reading', regions = false, ai = null }) {
-  const out = [];
-  for (let k = 0; k < pageNums.length; k++) {
-    const n = pageNums[k];
-    const base = 0.04 + 0.86 * k / pageNums.length;
-    prog(`${label} page ${n} of ${pdf.numPages}…`, base);
+  let done = 0; const t0 = Date.now();
+  const step = () => { done++; const left = pageNums.length - done; const per = (Date.now() - t0) / done; prog(`${label}: ${done} of ${pageNums.length} pages done${left ? ` – about ${Math.max(1, Math.round(per * left / Engine.POOL_N / 1000))} s left` : ''}`, 0.04 + 0.86 * done / pageNums.length); };
+  const res = await parallelMap(pageNums, ocr ? Engine.POOL_N : 2, async n => {
+    const out = [];
     const page = await pdf.getPage(n);
     const t = await pageTextItems(page);
     const chars = t.items.reduce((s, i) => s + i.str.trim().length, 0);
     const bad = chars >= 20 && Engine.garbled(t.items);
     if (ocr && (chars < 20 || bad)) {
       if (bad) Engine.note('garbled');
-      prog(`Page ${n}: repairing the image…`, base);
       const { cv } = await renderPage(page, 3400, Math.min(4, 2400 / t.w));
-      prog(`Page ${n}: reading text…`, base + 0.3 / pageNums.length);
       const pms = await Engine.processScanned(cv, { langs: ocrLangs, pageNo: n, photo: true, allowSplit: t.w > t.h * 1.15, ptW: t.w, ptH: t.h, wantRegions: regions, targetW: 2400, lowRes: false, ai });
       for (const pm of pms) {
         pm.lines = pm.kind === 'text' ? Engine.buildLines(pm.items, pm.w) : [];
         pm.rules = pm.kind === 'text' ? Engine.rulings(pm.display, pm.display.width / pm.w) : [];
         if (needImage || pm.kind === 'picture') pm.cv = shrink(pm.display, imgMax);
-        pm.display = null;
+        if (regions && pm.kind === 'text') Engine.chooseMode(pm);
+        if (!pm.keepDisplay) pm.display = null;
         out.push(pm);
       }
     } else {
@@ -399,8 +426,10 @@ async function readPdfPages(pdf, pageNums, { ocr, needImage, imgMax = 2000, labe
       out.push(pm);
     }
     page.cleanup();
-  }
-  return out;
+    step();
+    return out;
+  });
+  return res.flat();
 }
 function shrink(cv, maxSide) { const s = Math.min(1, maxSide / Math.max(cv.width, cv.height)); if (s >= 1) return cv; const c = newCanvas(cv.width * s, cv.height * s); const x = c.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(cv, 0, 0, c.width, c.height); return c; }
 function cropCv(cv, x, y, w, h) { x = Math.max(0, x); y = Math.max(0, y); w = Math.min(cv.width - x, w); h = Math.min(cv.height - y, h); const c = newCanvas(w, h); const t = c.getContext('2d'); t.fillStyle = '#fff'; t.fillRect(0, 0, c.width, c.height); t.drawImage(cv, x, y, w, h, 0, 0, w, h); return c; }
@@ -419,6 +448,35 @@ function pagesToText(pages) {
 }
 
 /* ---------------- writers ---------------- */
+/* faithful page: cleaned page picture behind, editable text placed exactly where it was printed */
+async function faithfulPage(D, pm) {
+  // everything hangs on ONE paragraph: the page picture behind, and one text box per piece of text on top
+  const emu = pt => Math.round(pt * 12700), px = pt => Math.max(1, Math.round(pt * 96 / 72));
+  const page = { horizontalPosition: { relative: D.HorizontalPositionRelativeFrom.PAGE, offset: 0 }, verticalPosition: { relative: D.VerticalPositionRelativeFrom.PAGE, offset: 0 } };
+  const runs = [new D.ImageRun({ type: 'jpg', data: await canvasBytes(pm.bg, 'image/jpeg', 0.85), transformation: { width: px(pm.w), height: px(pm.h) }, floating: { ...page, behindDocument: true, allowOverlap: true } })];
+  const body = Engine.bodySize(pm);
+  for (const L of pm.lines) {
+    for (const c of L.cells) {
+      const its = L.items.filter(i => i.x >= c.x - 1 && i.x <= c.x2 + 1);
+      const col = (its.find(i => i.color) || {}).color || '1a1a1a';
+      let size = Math.abs(L.size - body) < body * 0.22 ? body : L.size; // same-size body lines share one size
+      size = Math.max(5, Math.min(40, size));
+      const boxW = Math.max(4, c.x2 - c.x);
+      measureCtx.font = `${size}px Arial`; let wText = measureCtx.measureText(c.text).width;
+      if (wText > boxW * 1.25) { size = Math.max(5, size * boxW * 1.1 / wText); measureCtx.font = `${size}px Arial`; wText = measureCtx.measureText(c.text).width; }
+      const sp = Math.max(-size * 0.12, Math.min(size * 0.5, (boxW - wText) / Math.max(1, c.text.length)));
+      const top = L.top - size * 0.12;
+      runs.push(new D.WpsShapeRun({
+        type: 'wps', transformation: { width: px(boxW * 1.3 + size), height: px(size * 1.45) },
+        floating: { horizontalPosition: { relative: D.HorizontalPositionRelativeFrom.PAGE, offset: emu(c.x) }, verticalPosition: { relative: D.VerticalPositionRelativeFrom.PAGE, offset: emu(top) }, allowOverlap: true, behindDocument: false, wrap: { type: D.TextWrappingType.NONE } },
+        children: [new D.Paragraph({ spacing: { before: 0, after: 0, line: 240 }, children: [new D.TextRun({ text: c.text, font: 'Arial', size: Math.round(size * 2), color: col, characterSpacing: Math.round(sp * 20) })] })],
+        bodyProperties: { margins: { top: 0, bottom: 0, left: 0, right: 0 }, noAutoFit: true }
+      }));
+    }
+  }
+  return [new D.Paragraph({ children: runs })];
+}
+const measureCtx = document.createElement('canvas').getContext('2d');
 async function writeDocx(pages, mode, hf = {}) {
   const D = await lib.docx();
   const sections = [];
@@ -437,6 +495,11 @@ async function writeDocx(pages, mode, hf = {}) {
       const im = await pngOrJpg(cv);
       return new D.Paragraph({ alignment: align, children: [new D.ImageRun({ ...im, transformation: { width: Math.round(wPt * k * 96 / 72), height: Math.round(hPt * k * 96 / 72) } })] });
     };
+    if (pm.mode === 'faithful' && pm.bg && mode !== 'image') {
+      children.push(...(await faithfulPage(D, pm)));
+      sections.push({ properties: { page: { size: { width: tw(pw), height: tw(ph) }, margin: { top: 0, bottom: 0, left: 0, right: 0, header: 0, footer: 0 } } }, children });
+      continue;
+    }
     if (pm.kind === 'picture' || (mode !== 'text' && pm.cv)) {
       const cv = pm.cv; if (cv) children.push(await picture(cv, pw, ph * 0 + cv.height * pw / cv.width, D.AlignmentType.CENTER));
     }
@@ -625,18 +688,20 @@ async function buildScanPdf(cvs, place, { ocr, photo, allowSplit, label = 'Build
 }
 /* scans → page models for Word/Text */
 async function scansToPages(cvs, wantRegions) {
-  const pages = []; const ai = await aiOption();
-  for (let i = 0; i < cvs.length; i++) {
-    prog(`Page ${i + 1} of ${cvs.length}: repairing and reading…`, 0.08 + 0.85 * i / cvs.length);
-    const pms = await Engine.processScanned(cvs[i], { langs: ocrLangs, pageNo: i + 1, photo: false, allowSplit: true, ptW: 595.28, ptH: 841.89, wantRegions, targetW: 2400, ai });
+  const ai = await aiOption(); let done = 0;
+  const res = await parallelMap(cvs, Engine.POOL_N, async (cv, i) => {
+    const pms = await Engine.processScanned(cv, { langs: ocrLangs, pageNo: i + 1, photo: false, allowSplit: true, ptW: 595.28, ptH: 841.89, wantRegions, targetW: 2400, ai });
     for (const pm of pms) {
       pm.lines = pm.kind === 'text' ? Engine.buildLines(pm.items, pm.w) : [];
       pm.rules = pm.kind === 'text' ? Engine.rulings(pm.display, pm.display.width / pm.w) : [];
       if (pm.kind === 'picture') pm.cv = shrink(pm.display, 2000);
-      pm.display = null; pages.push(pm);
+      if (wantRegions && pm.kind === 'text') Engine.chooseMode(pm);
+      if (!pm.keepDisplay) pm.display = null;
     }
-  }
-  return pages;
+    done++; prog(`Read ${done} of ${cvs.length} pages…`, 0.08 + 0.85 * done / cvs.length);
+    return pms;
+  });
+  return res.flat();
 }
 const PAGE = { a4: [595.28, 841.89], letter: [612, 792] };
 /* place an image canvas on a page; returns {cv,pw,ph,rect} */
@@ -1147,7 +1212,7 @@ function autoQuad(cv) {
 let cropPg = null, cropState = null;
 function openCrop(pg) {
   cropPg = pg; cropState = { rot: pg.rot, quad: pg.quad.map(p => [...p]), filter: pg.filter };
-  $('#cropModal').classList.add('on'); drawCrop();
+  openModal('cropModal'); drawCrop();
 }
 function drawCrop() {
   const r = rotated(cropPg.src, cropState.rot);
@@ -1184,11 +1249,11 @@ function placeHandles() {
 $$('#cropFilters .opt').forEach(o => o.onclick = () => { cropState.filter = o.dataset.k; $$('#cropFilters .opt').forEach(x => x.classList.toggle('on', x === o)); });
 $('#cropRot').onclick = () => { cropState.rot = (cropState.rot + 1) % 4; cropState.quad = [[0, 0], [1, 0], [1, 1], [0, 1]]; drawCrop(); };
 $('#cropReset').onclick = () => { cropState.quad = [[0, 0], [1, 0], [1, 1], [0, 1]]; placeHandles(); };
-$('#cropCancel').onclick = () => $('#cropModal').classList.remove('on');
+$('#cropCancel').onclick = () => closeModal('cropModal');
 $('#cropOk').onclick = async () => {
   Object.assign(cropPg, cropState); $('#cropOk').disabled = true; await sleep(20);
   try { processScan(cropPg); } finally { $('#cropOk').disabled = false; }
-  $('#cropModal').classList.remove('on'); renderScans();
+  closeModal('cropModal'); renderScans();
 };
 window.addEventListener('resize', () => { if ($('#cropModal').classList.contains('on')) drawCrop(); });
 

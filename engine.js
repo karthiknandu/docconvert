@@ -40,6 +40,8 @@ const Engine = (() => {
     pageNums: n => `Removed ${n} page-number line(s) from the text`,
     columns: n => `Read ${n} two-column page(s) in the right order`,
     lists: n => `Rebuilt ${n} list item(s)`,
+    faithful: n => `Kept the original look for ${n} page(s) (forms, bills, receipts, cards) with the text editable in place`,
+    flowPages: n => `Rebuilt ${n} page(s) as flowing, editable text`,
     fit: n => `Adjusted text size so ${n} page(s) fit on one page each`
   };
   function reportLines() {
@@ -109,15 +111,15 @@ const Engine = (() => {
   }
   /* character-sized blobs → their bottom-centre points (robust against borders, photos, shadows) */
   function charPoints(P) {
-    const { b, w, h } = P; const lab = new Int32Array(b.length); const pts = []; let L = 0; const st = [];
+    const { b, w, h } = P; const lab = new Int32Array(b.length); const pts = []; const hts = []; let L = 0; const st = [];
     const maxH = Math.max(8, h * 0.03), maxW = Math.max(10, w * 0.06);
     for (let i = 0; i < b.length; i++) if (b[i] && !lab[i]) {
       L++; lab[i] = L; st.length = 0; st.push(i); let x0 = w, y0 = h, x1 = 0, y1 = 0, n = 0;
       while (st.length) { const p = st.pop(); const px = p % w, py = (p / w) | 0; n++; if (px < x0) x0 = px; if (px > x1) x1 = px; if (py < y0) y0 = py; if (py > y1) y1 = py; for (const q of [p - 1, p + 1, p - w, p + w]) { if (q < 0 || q >= b.length || lab[q] || !b[q]) continue; if (Math.abs((q % w) - px) > 1) continue; lab[q] = L; st.push(q); } }
       const bh = y1 - y0 + 1, bw = x1 - x0 + 1;
-      if (bh >= 3 && bh <= maxH && bw >= 2 && bw <= maxW && n >= 4) pts.push((x0 + x1) / 2, y1);
+      if (bh >= 3 && bh <= maxH && bw >= 2 && bw <= maxW && n >= 4) { pts.push((x0 + x1) / 2, y1); hts.push(bh); }
     }
-    return pts;
+    pts.heights = hts; return pts;
   }
   function bestAngle(pts, w, h, range) {
     let best = 0, bs = -1;
@@ -134,7 +136,8 @@ const Engine = (() => {
     const v0 = bestAngle(t, P.h, P.w, 15);
     const need = Math.abs(h0.a) > 3 ? 1.15 : 1.03;
     const angle = Math.abs(h0.a) >= 0.25 && h0.s > s0 * need ? +h0.a.toFixed(2) : 0;
-    return { angle, sideways: v0.s > h0.s * 1.3, text: true };
+    const hs = pts.heights.slice().sort((a, b) => a - b);
+    return { angle, sideways: v0.s > h0.s * 1.3, text: true, charH: hs[hs.length >> 1] / P.s };
   }
   /* --- blur: variance of Laplacian --- */
   function blurScore(P) {
@@ -149,22 +152,24 @@ const Engine = (() => {
     const W = cv.width, H = cv.height; const f = Math.max(4, Math.round(Math.max(W, H) / 220));
     const sw = Math.max(8, Math.round(W / f)), sh = Math.max(8, Math.round(H / f));
     const small = scaled(cv, sw, sh); const sd = ctx2(small).getImageData(0, 0, sw, sh); const d = sd.data;
+    // paper colour: bright end of each channel → one white-balance gain for the whole page (no colour blotches)
+    const pct = c => { const h = new Uint32Array(256); for (let i = c; i < d.length; i += 4) h[d[i]]++; let acc = 0; const tot = sw * sh; for (let v = 255; v >= 0; v--) { acc += h[v]; if (acc > tot * 0.1) return Math.max(60, v); } return 255; };
+    const gain = [pct(0), pct(1), pct(2)].map(v => 255 / v); const gm = Math.max(...gain); for (let c = 0; c < 3; c++) gain[c] /= gm;
+    // background brightness (shadows) from luminance only
+    let a = new Float32Array(sw * sh); for (let i = 0; i < sw * sh; i++) a[i] = d[i * 4] * 0.3 + d[i * 4 + 1] * 0.59 + d[i * 4 + 2] * 0.11;
     const r = Math.max(2, Math.round(Math.max(sw, sh) / 45));
-    for (let c = 0; c < 3; c++) {
-      let a = new Float32Array(sw * sh); for (let i = 0; i < sw * sh; i++) a[i] = d[i * 4 + c];
-      for (let pass = 0; pass < 2; pass++) { // dilate (max) horizontally then vertically
-        const t = new Float32Array(a.length);
-        for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) { let m = 0; for (let k = -r; k <= r; k++) { const xx = x + k; if (xx >= 0 && xx < sw) { const v = a[y * sw + xx]; if (v > m) m = v; } } t[y * sw + x] = m; }
-        for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) { let m = 0; for (let k = -r; k <= r; k++) { const yy = y + k; if (yy >= 0 && yy < sh) { const v = t[yy * sw + x]; if (v > m) m = v; } } a[y * sw + x] = m; }
-      }
-      for (let i = 0; i < sw * sh; i++) d[i * 4 + c] = a[i];
+    for (let pass = 0; pass < 2; pass++) {
+      const t = new Float32Array(a.length);
+      for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) { let m = 0; for (let k = -r; k <= r; k++) { const xx = x + k; if (xx >= 0 && xx < sw) { const v = a[y * sw + xx]; if (v > m) m = v; } } t[y * sw + x] = m; }
+      for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) { let m = 0; for (let k = -r; k <= r; k++) { const yy = y + k; if (yy >= 0 && yy < sh) { const v = t[yy * sw + x]; if (v > m) m = v; } } a[y * sw + x] = m; }
     }
+    for (let i = 0; i < sw * sh; i++) d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = a[i];
     ctx2(small).putImageData(sd, 0, 0);
     const bg = cnv(W, H); const bx = ctx2(bg); bx.filter = `blur(${Math.round(f * 2)}px)`; bx.imageSmoothingQuality = 'high'; bx.drawImage(small, 0, 0, W, H); bx.filter = 'none';
     const bd = bx.getImageData(0, 0, W, H).data; const out = cnv(W, H); const ox = ctx2(out); ox.drawImage(cv, 0, 0);
     const od = ox.getImageData(0, 0, W, H); const o = od.data;
-    for (let i = 0; i < o.length; i += 4) for (let c = 0; c < 3; c++) { const b = Math.max(60, bd[i + c]); o[i + c] = Math.min(255, o[i + c] * 255 / b); }
-    // contrast: push ink darker using luminance percentiles
+    for (let i = 0; i < o.length; i += 4) { const k = 255 / Math.max(60, bd[i]); for (let c = 0; c < 3; c++) o[i + c] = Math.min(255, o[i + c] * k * gain[c] * (c === 0 ? 1 : 1)); }
+    // contrast: push ink darker
     const hist = new Uint32Array(256); for (let i = 0; i < o.length; i += 16) hist[(o[i] * 77 + o[i + 1] * 150 + o[i + 2] * 29) >> 8]++;
     let tot = 0; for (const v of hist) tot += v; let acc = 0, lo = 0; for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc > tot * 0.004) { lo = v; break; } }
     lo = Math.min(lo, 120);
@@ -247,6 +252,12 @@ const Engine = (() => {
     P = probe(wh);
     const sk = detectSkew(P);
     if (sk.angle) { wh = rotateCanvas(wh, -sk.angle); note('deskew'); }
+    // reading resolution: aim for ~30 px tall characters – big print is read smaller (faster), tiny print enlarged
+    if (sk.charH) {
+      const k = Math.max(0.5, Math.min(1.4, 22 / sk.charH));
+      const nw = Math.round(wh.width * k);
+      if (Math.abs(k - 1) > 0.12 && nw >= 1100 && nw <= 2800) wh = scaled(wh, nw, wh.height * k);
+    }
     // blur
     const P2 = probe(wh, 1000); const bl = blurScore(P2);
     let blurry = false;
@@ -264,11 +275,29 @@ const Engine = (() => {
     workers[key] = (async () => { try { return await mk('write'); } catch (e) { return await mk('none'); } })();
     return workers[key];
   }
+  /* pool of OCR engines so several pages are read at the same time */
+  const POOL_N = (() => { try { const o = +localStorage.getItem('dc_pool'); if (o) return o; } catch (e) { } return Math.max(2, Math.min(3, Math.floor((navigator.hardwareConcurrency || 4) / 2))); })();
+  const pools = {};
+  async function newWorker(langs) {
+    const T = await lib.tesseract();
+    const mk = cacheMethod => T.createWorker(langs, 1, { workerPath: BASE + 'tess/worker.min.js', corePath: BASE + 'tess/', langPath: BASE + 'tessdata', gzip: true, cacheMethod });
+    try { return await mk('write'); } catch (e) { return await mk('none'); }
+  }
+  async function acquire(langs) {
+    const key = langs.join('+'); const P = pools[key] || (pools[key] = { n: 0, free: [], wait: [] });
+    if (P.free.length) return P.free.pop();
+    if (P.n < POOL_N) { P.n++; try { return await newWorker(langs); } catch (e) { P.n--; throw e; } }
+    return new Promise(r => P.wait.push(r));
+  }
+  function release(langs, w) { const P = pools[langs.join('+')]; const nx = P.wait.shift(); if (nx) nx(w); else P.free.push(w); }
+  const T = (k, t0) => { if (typeof window !== 'undefined' && window.__time) window.__time[k] = (window.__time[k] || 0) + (performance.now() - t0); };
   async function runOcr(img, langs, psm, wantPdf) {
-    const w = await worker(langs);
-    await w.setParameters({ tessedit_pageseg_mode: String(psm), preserve_interword_spaces: '1' });
-    const r = await w.recognize(img, { pdfTextOnly: true }, { blocks: true, text: true, pdf: !!wantPdf });
-    return { data: r.data, W: img.width, H: img.height, pdf: r.data.pdf ? new Uint8Array(r.data.pdf) : null };
+    const w = await acquire(langs); const t0 = performance.now();
+    try {
+      await w.setParameters({ tessedit_pageseg_mode: String(psm), preserve_interword_spaces: '1' });
+      const r = await w.recognize(img, { pdfTextOnly: true }, { blocks: true, text: true, pdf: !!wantPdf });
+      return { data: r.data, W: img.width, H: img.height, pdf: r.data.pdf ? new Uint8Array(r.data.pdf) : null };
+    } finally { T('ocr:' + img.width, t0); T('ocrCalls', t0 - 1); release(langs, w); }
   }
   const isWordy = t => { if (/^\(?(\d{1,3}|[a-z]|[ivx]{1,4})[.)]$/i.test(t) || /^[•·▪●◦○■➢►✓✔*\-–]$/.test(t)) return true; const a = (t.match(/[\p{L}\p{N}]/gu) || []).length; return a >= Math.max(1, t.length * 0.6); };
   /* flatten tesseract output into words + lines, apply junk filters */
@@ -339,7 +368,9 @@ const Engine = (() => {
   const PROBE_LANGS = ['hin', 'tam', 'tel', 'kan', 'mal', 'ben', 'guj', 'pan', 'ara', 'chi_sim', 'jpn', 'kor', 'rus', 'tha'];
   const LATIN = /^[\p{Script=Latin}\p{N}\p{P}\p{S}]+$/u;
   let probeWorker = null, probeLang = null, probes = 0, lastWinner = null, docLangs = null;
-  async function probeWith(lang, img) {
+  let probeChain = Promise.resolve();
+  function probeWith(lang, img) { const r = probeChain.then(() => probeWith1(lang, img)); probeChain = r.catch(() => { }); return r; } // one at a time
+  async function probeWith1(lang, img) {
     if (!probeWorker) { const T = await lib.tesseract(); probeWorker = await T.createWorker([lang], 1, { workerPath: BASE + 'tess/worker.min.js', corePath: BASE + 'tess/', langPath: BASE + 'tessdata', gzip: true }); }
     else if (probeLang !== lang) await probeWorker.reinitialize([lang], 1);
     probeLang = lang;
@@ -386,7 +417,7 @@ const Engine = (() => {
       else if (lay.langs) knownLangs = true;
     }
     // upright?
-    if ((H.meanConf < 62 || H.chars < 40 || page.sideways) && (page.ink || 0) > 0.004) {
+    if ((H.meanConf < 70 || H.chars < 80 || page.sideways) && (page.ink || 0) > 0.004) {
       const deg = await rotatedTry(img, useLangs, page.sideways);
       if (deg) {
         img = rotateCanvas(img, deg); display = rotateCanvas(display, deg); note('rotated');
@@ -405,7 +436,7 @@ const Engine = (() => {
       }
     }
     // alternative settings when the result is weak
-    if (H.meanConf < 78 || H.junkL > Math.max(4, H.lines.length * 0.35)) {
+    if (H.meanConf < 72 || H.junkL > Math.max(5, H.lines.length * 0.4)) {
       const variants = [['clean', () => runOcr(binarize(img), useLangs, 3, opts.wantPdf)], ['column', () => runOcr(img, useLangs, 4, opts.wantPdf)]];
       const pref = lay && lay.variant; if (pref === 'column') variants.reverse();
       for (let k = 0; k < variants.length; k++) {
@@ -422,7 +453,7 @@ const Engine = (() => {
     if (L) L.learnWords(H.lines.flatMap(l => l.words));
     note('junkWords', H.junkW); note('junkLines', H.junkL);
     if (H.meanConf < 70 && H.chars > 30) flag(pageNo);
-    return { H, img, display, textPdf: res.pdf };
+    return { H, img, display, textPdf: res.pdf, sig };
   }
 
   /* ================= stage 4: clean text ================= */
@@ -449,7 +480,7 @@ const Engine = (() => {
     H.lines.forEach((l, li) => {
       const lh = l.bbox.y1 - l.bbox.y0, tall = lh > l.rowH * 2.2;
       for (const w of l.words) {
-        const y0 = tall ? w.y0 : l.bbox.y0, h = tall ? (w.y1 - w.y0) * 1.25 : lh, sz = tall ? (w.y1 - w.y0) * 0.95 : l.rowH * 0.72;
+        const y0 = tall ? w.y0 : l.bbox.y0, h = tall ? (w.y1 - w.y0) * 1.25 : lh, sz = tall ? (w.y1 - w.y0) * 1.1 : lh; // line box height ≈ font size (calibrated)
         items.push({ x: w.x0 / pxPerPt, top: y0 / pxPerPt, w: (w.x1 - w.x0) / pxPerPt, h: h / pxPerPt, size: Math.max(5, sz / pxPerPt), str: fixToken(w.t, w.conf), conf: w.conf, para: l.para, ocr: true, li, src: w });
       }
     });
@@ -581,14 +612,18 @@ const Engine = (() => {
   /* ================= full page pipeline for scanned / photo pages =================
      cv: colour canvas of the page; ptW/ptH: target page size in pt (null = derive from 150 dpi)
      returns array of page models (normally 1; 2 if split) */
+  const tick = () => new Promise(r => setTimeout(r, 0));
   async function processScanned(cv, opts) {
-    const langs = opts.langs;
+    const langs = opts.langs; await tick();
+    const tR = performance.now();
     const parts = repair(cv, { pageNo: opts.pageNo, photo: opts.photo, allowSplit: opts.allowSplit, targetW: opts.targetW, lowRes: opts.lowRes });
+    T('repair', tR);
     if (parts.length > 1 && opts.ptW && opts.ptH) { opts = { ...opts }; const pw = opts.ptW, ph = opts.ptH; opts.ptW = Math.min(pw, ph) * 0.0 + (pw > ph ? ph * 0.707 : pw); opts.ptH = pw > ph ? ph : ph; }
     const out = [];
     for (const part of parts) {
       if (part.blank) { out.push({ kind: 'blank', n: opts.pageNo, display: part.display, items: [], lines: [], w: opts.ptW || 595, h: opts.ptH || 842 }); continue; }
       if (opts.ptH) { const pd = padTo(part.display, opts.ptW / opts.ptH); part.display = pd; part.ocrImg = pd; }
+      await tick();
       const rd = await read(part, langs, { pageNo: opts.pageNo, wantPdf: opts.wantPdf, allowProbe: opts.allowProbe, photo: opts.photo });
       let disp = rd.display;
       let pW = opts.ptW, pH = opts.ptH;
@@ -680,7 +715,7 @@ const Engine = (() => {
           } catch (e) { note('aiFail'); console.warn('laptop AI failed', e); }
         }
       }
-      out.push({ aiBlocks, uncertain, kind, n: opts.pageNo, w: ptW, h: ptH, display: disp, items: items2, images, ocr: true, conf: rd.H.meanConf, textPdf: rd.textPdf, ocrPx: { w: rd.img.width, h: rd.img.height } });
+      out.push({ sig: rd.sig, aiBlocks, uncertain, kind, n: opts.pageNo, w: ptW, h: ptH, display: disp, items: items2, images, ocr: true, conf: rd.H.meanConf, textPdf: rd.textPdf, ocrPx: { w: rd.img.width, h: rd.img.height } });
       note('ocr');
     }
     return out;
@@ -908,8 +943,66 @@ const Engine = (() => {
     return blocks;
   }
 
+  /* ================= self-check: rebuilt text or faithful layout? =================
+     Looks at what a rebuilt (flowing) page would lose and picks the mode per page. */
+  function chooseMode(pm) {
+    const disp = pm.display;
+    if (!disp || pm.kind !== 'text') { pm.mode = 'flow'; return pm.mode; }
+    const k = disp.width / pm.w; const L = pm.lines || []; const n = L.length;
+    const multi = n ? L.filter(l => l.cells.length >= 2).length / n : 0;
+    const rs = L.map(l => l.right).sort((a, b) => a - b), tr = rs.length ? rs[Math.floor(rs.length * 0.9)] : pm.w, tl = n ? median(L.map(l => l.x)) : 0;
+    const longFrac = n ? L.filter(l => (l.right - l.x) > (tr - tl) * 0.55).length / n : 0;
+    const toks = L.flatMap(l => l.items.map(i => i.str)); const numeric = toks.length ? toks.filter(t => /\d/.test(t)).length / toks.length : 0;
+    // ink that a rebuilt page would drop (boxes, stamps, handwriting, logos not kept as pictures)
+    const P = probe(disp, 600); const W = P.w, H = P.h, m = P.b.slice(), s = P.s;
+    let total = 0; for (let i = 0; i < m.length; i++) total += m[i];
+    for (let y = 0; y < H; y++) { let run = 0; for (let x = 0; x <= W; x++) { if (x < W && m[y * W + x]) run++; else { if (run > W * 0.15) for (let q = x - run; q < x; q++) m[y * W + q] = 0; run = 0; } } }
+    const clear = (x0, y0, x1, y1, pad) => { const a = Math.max(0, Math.floor(x0 * s) - pad), b = Math.min(W - 1, Math.ceil(x1 * s) + pad), c = Math.max(0, Math.floor(y0 * s) - pad), d = Math.min(H - 1, Math.ceil(y1 * s) + pad); for (let y = c; y <= d; y++) m.fill(0, y * W + a, y * W + b + 1); };
+    for (const it of pm.items || []) clear(it.x * k, it.top * k, (it.x + it.w) * k, (it.top + it.h) * k, 2);
+    for (const im of pm.images || []) clear(im.x * k, im.top * k, (im.x + im.w) * k, (im.top + im.h) * k, 1);
+    let left = 0; for (let i = 0; i < m.length; i++) left += m[i];
+    const lost = total ? left / total : 0;
+    const rules = (pm.rules || []).length;
+    const why = [];
+    if (rules >= 4) why.push('ruled boxes'); if (multi > 0.3) why.push('columns of values'); if (lost > 0.2) why.push('stamps/handwriting/marks');
+    if (numeric > 0.3) why.push('mostly numbers'); if (n < 6) why.push('few lines'); if (longFrac < 0.35) why.push('short fields');
+    if (!why.length) { const s2 = fitScale(layout(pm), pm, pm.w - 72, pm.h - 72); if (s2 < 0.8) why.push('too much text to reflow'); }
+    pm.mode = why.length ? 'faithful' : 'flow'; pm.modeWhy = why;
+    note(pm.mode === 'faithful' ? 'faithful' : 'flowPages');
+    if (typeof Learn !== 'undefined' && pm.sig) Learn.rememberLayout(pm.sig, { mode: pm.mode });
+    if (pm.mode === 'faithful') prepareFaithful(pm);
+    return pm.mode;
+  }
+  /* background with the recognised text erased + the colour of each word */
+  function prepareFaithful(pm) {
+    const disp = pm.display; const scale = Math.min(1, 1800 / disp.width);
+    const bg = scaled(disp, disp.width * scale, disp.height * scale); const x = ctx2(bg);
+    const id = x.getImageData(0, 0, bg.width, bg.height); const d = id.data; const W = bg.width, H = bg.height;
+    const k = bg.width / pm.w;
+    const lum = i => d[i] * 0.3 + d[i + 1] * 0.59 + d[i + 2] * 0.11;
+    for (const it of pm.items || []) {
+      const x0 = Math.max(0, Math.floor(it.x * k) - 2), y0 = Math.max(0, Math.floor(it.top * k) - 2), x1 = Math.min(W - 1, Math.ceil((it.x + it.w) * k) + 2), y1 = Math.min(H - 1, Math.ceil((it.top + it.h) * k) + 2);
+      if (x1 <= x0 || y1 <= y0) continue;
+      // ring around the word = paper colour there
+      const ring = [[], [], []]; const R = 4;
+      for (let y = Math.max(0, y0 - R); y <= Math.min(H - 1, y1 + R); y++) for (let xx = Math.max(0, x0 - R); xx <= Math.min(W - 1, x1 + R); xx++) {
+        if (y >= y0 && y <= y1 && xx >= x0 && xx <= x1) continue; const i = (y * W + xx) * 4; ring[0].push(d[i]); ring[1].push(d[i + 1]); ring[2].push(d[i + 2]);
+      }
+      const bgc = ring.map(a => { a.sort((p, q) => p - q); return a[Math.floor(a.length * 0.7)] || 255; });
+      // ink colour inside the word
+      let n = 0, sr = 0, sg = 0, sb = 0; const bl = bgc[0] * 0.3 + bgc[1] * 0.59 + bgc[2] * 0.11;
+      for (let y = y0; y <= y1; y++) for (let xx = x0; xx <= x1; xx++) { const i = (y * W + xx) * 4; if (lum(i) < bl - 70) { n++; sr += d[i]; sg += d[i + 1]; sb += d[i + 2]; } }
+      it.color = n > 4 ? [sr / n, sg / n, sb / n].map(v => Math.max(0, Math.min(255, Math.round(v * 0.8)))).map(v => v.toString(16).padStart(2, '0')).join('') : '1a1a1a';
+      for (let y = y0; y <= y1; y++) for (let xx = x0; xx <= x1; xx++) { const i = (y * W + xx) * 4; d[i] = bgc[0]; d[i + 1] = bgc[1]; d[i + 2] = bgc[2]; }
+    }
+    x.putImageData(id, 0, 0);
+    pm.bg = bg;
+    // keep word colours on the line items too (lines are rebuilt from items)
+    pm.lines = buildLines(pm.items, pm.w);
+  }
+
   /* estimate if a page's content fits; returns a font scale (<=1) */
-  function bodySize(pm) { const sz = (pm.lines || []).flatMap(L => L.items.map(() => L.size)); const m = median(sz) || 11; return Math.max(8.5, Math.min(12, Math.round(m * 2) / 2)); }
+  function bodySize(pm) { const sz = (pm.lines || []).flatMap(L => L.items.map(() => L.size)); const m = median(sz) || 11; return Math.max(8, Math.min(13, Math.round(m * 2) / 2)); }
   function fitScale(blocks, pm, contentW, contentH) {
     const base = bodySize(pm);
     const est = s => {
@@ -927,5 +1020,5 @@ const Engine = (() => {
     return s;
   }
 
-  return { mdToBlocks, bodySize, resetReport, reportLines, flaggedPages, note, flag, repair, read, processScanned, garbled, buildLines, layout, headersFooters, rulings, fitScale, grid, pictureRegions, toItems, setDocLangs: l => { docLangs = l; }, worker };
+  return { chooseMode, prepareFaithful, POOL_N, mdToBlocks, bodySize, resetReport, reportLines, flaggedPages, note, flag, repair, read, processScanned, garbled, buildLines, layout, headersFooters, rulings, fitScale, grid, pictureRegions, toItems, setDocLangs: l => { docLangs = l; }, worker };
 })();
