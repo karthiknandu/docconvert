@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1f3a68">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>DocConvert – PDF, Scan &amp; OCR</title>
+<style>
+:root{
+  --bg:#f4f6fa; --card:#fff; --ink:#18212f; --muted:#5d6878; --line:#dde3ec;
+  --brand:#1f3a68; --brand2:#2f5ea8; --accent:#e8eef8; --ok:#1d7a46; --err:#b42318;
+  --r:14px;
+}
+@media (prefers-color-scheme: dark){
+  :root{--bg:#10141b; --card:#1a2029; --ink:#e7ebf1; --muted:#9aa5b5; --line:#2b3340; --brand:#8fb3ef; --brand2:#6c97e0; --accent:#22304a;}
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans",sans-serif}
+header{position:sticky;top:0;z-index:5;background:var(--bg);padding:14px 16px 8px}
+.top{display:flex;align-items:center;gap:10px;max-width:760px;margin:0 auto}
+.logo{width:34px;height:34px;border-radius:9px;background:var(--brand);display:grid;place-items:center;color:#fff;font-weight:700;font-size:15px}
+@media (prefers-color-scheme: dark){.logo{color:#10141b}}
+h1{font-size:19px;margin:0;flex:1}
+.chip{border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:999px;padding:7px 12px;font-size:14px;cursor:pointer;max-width:55vw;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+nav{display:flex;gap:6px;max-width:760px;margin:12px auto 0;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:4px}
+nav button{flex:1;border:0;background:transparent;color:var(--muted);padding:10px 4px;border-radius:9px;font-size:15px;font-weight:600;cursor:pointer}
+nav button.on{background:var(--brand);color:#fff}
+@media (prefers-color-scheme: dark){nav button.on{color:#10141b}}
+main{max-width:760px;margin:0 auto;padding:6px 16px 90px}
+section{display:none} section.on{display:block}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:16px;margin:12px 0}
+.card h2{font-size:16px;margin:0 0 10px}
+.drop{border:2px dashed var(--line);border-radius:12px;padding:22px 12px;text-align:center;color:var(--muted);cursor:pointer}
+.drop.has{border-style:solid;border-color:var(--brand2);color:var(--ink);background:var(--accent)}
+.drop b{color:var(--ink)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(105px,1fr));gap:8px}
+.opt{border:1px solid var(--line);border-radius:11px;padding:12px 6px;text-align:center;cursor:pointer;background:var(--card);font-size:14px;color:var(--ink)}
+.opt .ic{font-size:22px;display:block;margin-bottom:3px}
+.opt.on{border-color:var(--brand2);background:var(--accent);font-weight:600;box-shadow:0 0 0 1px var(--brand2) inset}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+label.ck{display:flex;gap:8px;align-items:flex-start;font-size:14px;color:var(--ink);margin-top:10px}
+label.ck input{margin-top:3px;width:18px;height:18px}
+.hint{font-size:13px;color:var(--muted);margin-top:6px}
+select{font:inherit;padding:8px;border-radius:9px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
+.btn{border:0;border-radius:11px;padding:13px 18px;font-size:16px;font-weight:600;cursor:pointer;background:var(--brand);color:#fff}
+@media (prefers-color-scheme: dark){.btn{color:#10141b}}
+.btn.sec{background:var(--accent);color:var(--ink)}
+.btn.wide{width:100%}
+.btn:disabled{opacity:.45;cursor:default}
+.prog{display:none}
+.prog.on{display:block}
+.bar{height:8px;background:var(--accent);border-radius:9px;overflow:hidden;margin-top:8px}
+.bar i{display:block;height:100%;width:0;background:var(--brand2);transition:width .2s}
+.msg{font-size:14px;color:var(--muted)}
+.result{display:none}
+.result.on{display:block}
+.files{list-style:none;padding:0;margin:8px 0 0}
+.files li{display:flex;align-items:center;gap:10px;padding:10px 0;border-top:1px solid var(--line)}
+.files li span{flex:1;overflow-wrap:anywhere;font-size:14px}
+.err{color:var(--err)}
+.pages{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px;margin-top:12px}
+.pg{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--bg);position:relative}
+.pg img{display:block;width:100%;height:170px;object-fit:contain;background:#fff}
+.pg .n{position:absolute;top:6px;left:6px;background:var(--brand);color:#fff;font-size:12px;border-radius:6px;padding:1px 7px}
+.pg .tools{display:flex;justify-content:space-around;padding:4px}
+.pg .tools button{border:0;background:transparent;font-size:18px;padding:6px;cursor:pointer;color:var(--ink)}
+/* modal */
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:20;display:none;align-items:flex-end;justify-content:center}
+.modal.on{display:flex}
+.sheet{background:var(--card);width:100%;max-width:760px;max-height:92vh;border-radius:18px 18px 0 0;padding:16px;display:flex;flex-direction:column}
+.sheet h3{margin:0 0 10px;font-size:17px}
+.langlist{overflow:auto;flex:1;border:1px solid var(--line);border-radius:10px;margin:10px 0}
+.langlist label{display:flex;gap:10px;align-items:center;padding:11px 12px;border-bottom:1px solid var(--line);font-size:15px}
+.langlist label input{width:18px;height:18px}
+input[type=search]{font:inherit;padding:10px;border-radius:10px;border:1px solid var(--line);width:100%;background:var(--bg);color:var(--ink)}
+.cropwrap{position:relative;flex:1;min-height:0;display:flex;align-items:center;justify-content:center;background:#000;border-radius:10px;overflow:hidden;touch-action:none}
+.cropwrap canvas{max-width:100%;max-height:62vh;display:block}
+.handle{position:absolute;width:30px;height:30px;margin:-15px 0 0 -15px;border-radius:50%;background:rgba(47,94,168,.35);border:3px solid #fff;touch-action:none}
+.cropsvg{position:absolute;inset:0;pointer-events:none}
+.filters{display:flex;gap:6px;overflow:auto;margin-top:10px}
+.filters .opt{flex:0 0 auto;padding:9px 12px}
+.foot{font-size:12px;color:var(--muted);text-align:center;margin-top:24px}
+</style>
+</head>
+<body>
+<header>
+  <div class="top">
+    <div class="logo">DC</div>
+    <h1>DocConvert</h1>
+    <button class="chip" id="langChip" title="OCR languages">OCR: English</button>
+  </div>
+  <nav id="tabs">
+    <button data-t="from" class="on">From PDF</button>
+    <button data-t="to">To PDF</button>
+    <button data-t="scan">Scan</button>
+  </nav>
+</header>
+
+<main>
+<!-- FROM PDF -->
+<section id="from" class="on">
+  <div class="card">
+    <h2>1. Choose a PDF</h2>
+    <div class="drop" id="fromDrop"><b>Tap to choose a PDF</b><br>or drop it here</div>
+    <input type="file" id="fromFile" accept="application/pdf,.pdf" hidden>
+  </div>
+  <div class="card">
+    <h2>2. Convert to</h2>
+    <div class="grid" id="fromFmt">
+      <div class="opt on" data-f="docx"><span class="ic">📝</span>Word</div>
+      <div class="opt" data-f="xlsx"><span class="ic">📊</span>Excel</div>
+      <div class="opt" data-f="pptx"><span class="ic">📽️</span>PowerPoint</div>
+      <div class="opt" data-f="jpg"><span class="ic">🖼️</span>Images</div>
+      <div class="opt" data-f="txt"><span class="ic">🔤</span>Text</div>
+      <div class="opt" data-f="ocrpdf"><span class="ic">🔍</span>Searchable PDF</div>
+    </div>
+    <div id="fromOpts"></div>
+    <label class="ck"><input type="checkbox" id="fromOcr" checked><span>Use OCR for scanned pages<br><span class="hint">Pages without real text are read with OCR in the chosen languages.</span></span></label>
+    <div class="row"><span class="msg">Pages:</span><select id="fromRange"><option value="all">All pages</option><option value="first">First page only</option><option value="custom">Choose…</option></select><input id="fromCustom" placeholder="e.g. 1-3,5" style="display:none;font:inherit;padding:8px;border-radius:9px;border:1px solid var(--line);width:120px;background:var(--card);color:var(--ink)"></div>
+  </div>
+  <button class="btn wide" id="fromGo" disabled>Convert</button>
+</section>
+
+<!-- TO PDF -->
+<section id="to">
+  <div class="card">
+    <h2>1. Choose files</h2>
+    <div class="drop" id="toDrop"><b>Tap to choose files</b><br>Word, Excel, PowerPoint, images or text</div>
+    <input type="file" id="toFile" multiple accept=".docx,.xlsx,.xls,.csv,.pptx,.txt,.md,.json,.html,.htm,image/*" hidden>
+    <ul class="files" id="toList"></ul>
+    <div class="hint">Several images are combined into one PDF. Other files are converted one by one.</div>
+  </div>
+  <div class="card">
+    <h2>2. Options</h2>
+    <div class="row"><span class="msg">Page size:</span>
+      <select id="toSize"><option value="a4">A4</option><option value="letter">Letter</option><option value="fit">Fit to content</option></select>
+      <select id="toOrient"><option value="auto">Auto orientation</option><option value="p">Portrait</option><option value="l">Landscape</option></select>
+    </div>
+    <label class="ck"><input type="checkbox" id="toOcr"><span>Make text searchable (OCR)<br><span class="hint">Adds a hidden text layer so you can search and copy. Slower.</span></span></label>
+  </div>
+  <button class="btn wide" id="toGo" disabled>Create PDF</button>
+</section>
+
+<!-- SCAN -->
+<section id="scan">
+  <div class="card">
+    <h2>Scan pages</h2>
+    <div class="row">
+      <button class="btn" id="scanCam">📷 Take photo</button>
+      <button class="btn sec" id="scanGal">🖼️ From gallery</button>
+    </div>
+    <input type="file" id="scanCamIn" accept="image/*" capture="environment" hidden>
+    <input type="file" id="scanGalIn" accept="image/*" multiple hidden>
+    <div class="hint">Tap ✂️ on a page to crop the corners and pick a filter. Use ◀ ▶ to reorder.</div>
+    <div class="pages" id="scanPages"></div>
+  </div>
+  <div class="card">
+    <h2>Save as</h2>
+    <div class="grid" id="scanFmt">
+      <div class="opt on" data-f="pdf"><span class="ic">📄</span>PDF</div>
+      <div class="opt" data-f="docx"><span class="ic">📝</span>Word (OCR)</div>
+      <div class="opt" data-f="txt"><span class="ic">🔤</span>Text (OCR)</div>
+      <div class="opt" data-f="jpg"><span class="ic">🖼️</span>Images</div>
+    </div>
+    <label class="ck" id="scanOcrRow"><input type="checkbox" id="scanOcr" checked><span>Make PDF searchable (OCR)</span></label>
+    <div class="row"><span class="msg">Page size:</span><select id="scanSize"><option value="a4">A4</option><option value="letter">Letter</option><option value="fit">Same as photo</option></select></div>
+  </div>
+  <button class="btn wide" id="scanGo" disabled>Save</button>
+</section>
+
+<div class="card prog" id="prog"><div class="msg" id="progMsg">Working…</div><div class="bar"><i id="progBar"></i></div></div>
+<div class="card result" id="result"><h2 id="resTitle">Done</h2><ul class="files" id="resList"></ul><div class="hint" id="resHint"></div></div>
+<div class="foot">Files are processed on this device. Nothing is uploaded.</div>
+</main>
+
+<!-- language modal -->
+<div class="modal" id="langModal"><div class="sheet">
+  <h3>OCR languages <span class="msg">(up to 3)</span></h3>
+  <input type="search" id="langSearch" placeholder="Search languages…">
+  <div class="langlist" id="langList"></div>
+  <div class="hint">Each language is loaded the first time you use it.</div>
+  <div class="row"><button class="btn wide" id="langDone">Done</button></div>
+</div></div>
+
+<!-- crop modal -->
+<div class="modal" id="cropModal"><div class="sheet" style="height:94vh">
+  <h3>Adjust page</h3>
+  <div class="cropwrap" id="cropWrap"><canvas id="cropCv"></canvas><svg class="cropsvg" id="cropSvg"><polygon id="cropPoly" fill="rgba(47,94,168,.18)" stroke="#fff" stroke-width="2"/></svg></div>
+  <div class="filters" id="cropFilters">
+    <div class="opt" data-k="orig">Original</div>
+    <div class="opt" data-k="enh">Enhanced</div>
+    <div class="opt" data-k="gray">Grey</div>
+    <div class="opt" data-k="bw">B&amp;W</div>
+  </div>
+  <div class="row">
+    <button class="btn sec" id="cropRot">↻ Rotate</button>
+    <button class="btn sec" id="cropReset">Full page</button>
+    <span style="flex:1"></span>
+    <button class="btn sec" id="cropCancel">Cancel</button>
+    <button class="btn" id="cropOk">Apply</button>
+  </div>
+</div></div>
+
+<script src="langs.js"></script>
+<script src="app.js"></script>
+<script>if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});</script>
+</body>
+</html>
