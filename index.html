@@ -82,6 +82,11 @@ input[type=search]{font:inherit;padding:10px;border-radius:10px;border:1px solid
 .cropsvg{position:absolute;inset:0;pointer-events:none}
 .filters{display:flex;gap:6px;overflow:auto;margin-top:10px}
 .filters .opt{flex:0 0 auto;padding:9px 12px}
+.report{margin-top:12px;font-size:13.5px}
+.report b{display:block;margin-bottom:4px}
+.report ul{margin:0;padding-left:18px;color:var(--ink)}
+.report li{margin:3px 0}
+.report .warn{color:#b26a00}
 .foot{font-size:12px;color:var(--muted);text-align:center;margin-top:24px}
 </style>
 </head>
@@ -172,7 +177,7 @@ input[type=search]{font:inherit;padding:10px;border-radius:10px;border:1px solid
 </section>
 
 <div class="card prog" id="prog"><div class="msg" id="progMsg">Working…</div><div class="bar"><i id="progBar"></i></div></div>
-<div class="card result" id="result"><h2 id="resTitle">Done</h2><ul class="files" id="resList"></ul><div class="hint" id="resHint"></div></div>
+<div class="card result" id="result"><h2 id="resTitle">Done</h2><ul class="files" id="resList"></ul><div class="hint" id="resHint"></div><div id="resReport" class="report"></div></div>
 <div class="foot">Files are processed on this device. Nothing is uploaded.</div>
 </main>
 
@@ -205,6 +210,7 @@ input[type=search]{font:inherit;padding:10px;border-radius:10px;border:1px solid
 </div></div>
 
 <script src="langs.js"></script>
+<script src="engine.js"></script>
 <script src="app.js"></script>
 <script>if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});</script>
 </body>

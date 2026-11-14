@@ -91,7 +91,7 @@ async function saveFile(blob, name, btn) {
   if (btn) btn.textContent = 'Saved ✓';
 }
 function fmtSize(n) { return n > 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB'; }
-function showResult(files, hint) {
+function showResult(files, hint, withReport) {
   const ul = $('#resList'); ul.innerHTML = '';
   $('#resTitle').textContent = files.length > 1 ? 'Done – ' + files.length + ' files' : 'Done';
   for (const f of files) {
@@ -103,11 +103,22 @@ function showResult(files, hint) {
   }
   $('#resHint').textContent = hint || '';
   $('#resHint').classList.remove('err');
+  const rep = $('#resReport'); rep.innerHTML = '';
+  if (withReport && typeof Engine !== "undefined") {
+    const lines = Engine.reportLines(), fl = Engine.flaggedPages();
+    if (lines.length || fl.length) {
+      rep.innerHTML = '<b>Fixed automatically</b>';
+      const u = document.createElement('ul');
+      for (const l of lines) { const li = document.createElement('li'); li.textContent = l; u.appendChild(li); }
+      if (fl.length) { const li = document.createElement('li'); li.className = 'warn'; li.textContent = `Please check page${fl.length > 1 ? 's' : ''} ${fl.join(', ')} – the photo quality is low, some words may be wrong.`; u.appendChild(li); }
+      rep.appendChild(u);
+    }
+  }
   $('#result').classList.add('on');
   $('#result').scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 function toastErr(msg) {
-  $('#resList').innerHTML = ''; $('#resTitle').textContent = 'Something went wrong';
+  $('#resList').innerHTML = ''; $('#resReport').innerHTML = ''; $('#resTitle').textContent = 'Something went wrong';
   $('#resHint').textContent = msg; $('#resHint').classList.add('err');
   $('#result').classList.add('on');
 }
@@ -164,28 +175,11 @@ $('#langChip').onclick = () => { $('#langSearch').value = ''; renderLangList('')
 $('#langSearch').oninput = e => renderLangList(e.target.value);
 $('#langDone').onclick = () => { $('#langModal').classList.remove('on'); store.set('langs', ocrLangs); };
 
-let ocrWorker = null, ocrWorkerKey = '';
 async function getOcr() {
-  const key = ocrLangs.join('+');
-  if (ocrWorker && ocrWorkerKey === key) return ocrWorker;
-  if (ocrWorker) { try { await ocrWorker.terminate(); } catch (e) { } ocrWorker = null; }
-  const T = await lib.tesseract();
-  const mk = cacheMethod => T.createWorker(ocrLangs, 1, {
-    workerPath: BASE + 'tess/worker.min.js',
-    corePath: BASE + 'tess/',
-    langPath: BASE + 'tessdata',
-    gzip: true,
-    cacheMethod,
-    logger: m => {
-      if (m.status === 'loading language traineddata') prog('Loading OCR language data (' + ocrLangs.map(langName).join(', ') + ')…', null);
-      else if (m.status === 'loading tesseract core') prog('Starting OCR engine…', null);
-    }
-  });
-  prog('Starting OCR engine…', null);
-  try { ocrWorker = await mk('write'); }
-  catch (e) { console.warn('OCR init with cache failed, retrying without', e); ocrWorker = await mk('none'); }
-  ocrWorkerKey = key;
-  return ocrWorker;
+  prog('Starting OCR engine (' + ocrLangs.map(langName).join(', ') + ')…', null);
+  const w = await Engine.worker(ocrLangs);
+  await w.setParameters({ tessedit_pageseg_mode: '3' });
+  return w;
 }
 /* OCR one canvas. Returns {items (in canvas px), textPdf (Uint8Array|null), text} */
 async function ocrCanvas(cv, wantPdf) {
@@ -262,195 +256,160 @@ function parseRange(str, n) {
   }
   return [...set].sort((a, b) => a - b);
 }
-/* Read a PDF into page models: {w,h,items,lines,ocr,cv?} */
-async function readPdfPages(pdf, pageNums, { ocr, needImage, imgMax = 2200, label = 'Reading' }) {
+/* Read a PDF into page models via the quality engine */
+async function readPdfPages(pdf, pageNums, { ocr, needImage, imgMax = 2000, label = 'Reading', regions = false }) {
   const out = [];
   for (let k = 0; k < pageNums.length; k++) {
     const n = pageNums[k];
-    prog(`${label} page ${n} of ${pdf.numPages}…`, 0.05 + 0.85 * k / pageNums.length);
+    const base = 0.04 + 0.86 * k / pageNums.length;
+    prog(`${label} page ${n} of ${pdf.numPages}…`, base);
     const page = await pdf.getPage(n);
     const t = await pageTextItems(page);
     const chars = t.items.reduce((s, i) => s + i.str.trim().length, 0);
-    const pm = { n, w: t.w, h: t.h, items: t.items, ocr: false };
-    let rendered = null;
-    if (ocr && chars < 20) {
-      prog(`OCR on page ${n} of ${pdf.numPages}…`, 0.05 + 0.85 * k / pageNums.length);
-      rendered = await renderPage(page, 2400);
-      const r = await ocrCanvas(rendered.cv, false);
-      const s = rendered.scale;
-      pm.items = r.items.map(i => ({ ...i, x: i.x / s, top: i.top / s, w: i.w / s, h: i.h / s, size: i.size / s }));
-      pm.ocr = true;
+    const bad = chars >= 20 && Engine.garbled(t.items);
+    if (ocr && (chars < 20 || bad)) {
+      if (bad) Engine.note('garbled');
+      prog(`Page ${n}: repairing the image…`, base);
+      const { cv } = await renderPage(page, 3400, Math.min(4, 2400 / t.w));
+      prog(`Page ${n}: reading text…`, base + 0.3 / pageNums.length);
+      const pms = await Engine.processScanned(cv, { langs: ocrLangs, pageNo: n, photo: true, allowSplit: t.w > t.h * 1.15, ptW: t.w, ptH: t.h, wantRegions: regions, targetW: 2400, lowRes: false });
+      for (const pm of pms) {
+        pm.lines = pm.kind === 'text' ? Engine.buildLines(pm.items, pm.w) : [];
+        pm.rules = pm.kind === 'text' ? Engine.rulings(pm.display, pm.display.width / pm.w) : [];
+        if (needImage || pm.kind === 'picture') pm.cv = shrink(pm.display, imgMax);
+        pm.display = null;
+        out.push(pm);
+      }
+    } else {
+      const pm = { n, w: t.w, h: t.h, items: t.items, kind: chars ? 'text' : 'empty', ocr: false };
+      pm.lines = Engine.buildLines(t.items, t.w);
+      if (needImage || regions) {
+        const r = await renderPage(page, imgMax);
+        if (needImage) pm.cv = r.cv;
+        if (regions && pm.kind === 'text') {
+          const pxPerPt = r.cv.width / t.w;
+          const boxes = t.items.map(i => ({ x0: i.x * pxPerPt, y0: i.top * pxPerPt, x1: (i.x + i.w) * pxPerPt, y1: (i.top + i.h) * pxPerPt }));
+          pm.images = Engine.pictureRegions(r.cv, boxes, { minArea: 0.008 }).map(g => ({ cv: cropCv(r.cv, g.x0 - 4, g.y0 - 4, g.x1 - g.x0 + 8, g.y1 - g.y0 + 8), x: (g.x0 - 4) / pxPerPt, top: (g.y0 - 4) / pxPerPt, w: (g.x1 - g.x0 + 8) / pxPerPt, h: (g.y1 - g.y0 + 8) / pxPerPt }));
+          if (pm.images.length) Engine.note('images', pm.images.length);
+          pm.rules = Engine.rulings(r.cv, pxPerPt);
+        }
+      }
+      out.push(pm);
     }
-    if (needImage) pm.cv = (rendered && Math.max(rendered.cv.width, rendered.cv.height) <= imgMax * 1.2) ? rendered.cv : (await renderPage(page, imgMax)).cv;
-    pm.lines = buildLines(pm.items);
     page.cleanup();
-    out.push(pm);
   }
   return out;
 }
+function shrink(cv, maxSide) { const s = Math.min(1, maxSide / Math.max(cv.width, cv.height)); if (s >= 1) return cv; const c = newCanvas(cv.width * s, cv.height * s); const x = c.getContext('2d'); x.imageSmoothingQuality = 'high'; x.drawImage(cv, 0, 0, c.width, c.height); return c; }
+function cropCv(cv, x, y, w, h) { x = Math.max(0, x); y = Math.max(0, y); w = Math.min(cv.width - x, w); h = Math.min(cv.height - y, h); const c = newCanvas(w, h); const t = c.getContext('2d'); t.fillStyle = '#fff'; t.fillRect(0, 0, c.width, c.height); t.drawImage(cv, x, y, w, h, 0, 0, w, h); return c; }
 
-/* ---------------- layout analysis ---------------- */
+/* ---------------- layout (engine) ---------------- */
 function median(a) { if (!a.length) return 0; const s = [...a].sort((x, y) => x - y); return s[s.length >> 1]; }
-function buildLines(items) {
-  const its = items.filter(i => i.str.trim()).map(i => ({ ...i, cy: i.top + i.h / 2 })).sort((a, b) => a.cy - b.cy || a.x - b.x);
-  const lines = [];
-  for (const it of its) {
-    let ln = null;
-    for (let j = lines.length - 1; j >= 0 && j >= lines.length - 3; j--) {
-      const L = lines[j];
-      if (Math.abs(L.cy - it.cy) < Math.min(L.size, it.size) * 0.5) { ln = L; break; }
-    }
-    if (!ln) { ln = { items: [], cy: it.cy, size: it.size }; lines.push(ln); }
-    ln.items.push(it);
-    ln.cy = ln.items.reduce((s, i) => s + i.cy, 0) / ln.items.length;
-    ln.size = median(ln.items.map(i => i.size));
-  }
-  for (const L of lines) {
-    L.items.sort((a, b) => a.x - b.x);
-    L.top = Math.min(...L.items.map(i => i.top)); L.bottom = Math.max(...L.items.map(i => i.top + i.h));
-    L.x = L.items[0].x; L.right = Math.max(...L.items.map(i => i.x + i.w));
-    // cells: split on big gaps
-    const cells = []; let cur = null;
-    for (const it of L.items) {
-      const gap = cur ? it.x - cur.x2 : Infinity;
-      const big = Math.max(L.size * 1.2, 9);
-      if (!cur || gap > big) { cur = { x: it.x, x2: it.x + it.w, text: it.str }; cells.push(cur); }
-      else {
-        const sp = gap > L.size * 0.12 && !/\s$/.test(cur.text) && !/^\s/.test(it.str);
-        cur.text += (sp ? ' ' : '') + it.str; cur.x2 = Math.max(cur.x2, it.x + it.w);
-      }
-    }
-    for (const c of cells) c.text = c.text.replace(/\s+/g, ' ').trim();
-    L.cells = cells.filter(c => c.text);
-    L.text = L.cells.map(c => c.text).join(L.cells.length > 1 ? '\t' : '');
-  }
-  return lines.filter(L => L.cells.length).sort((a, b) => a.top - b.top);
-}
-/* Column intervals from multi-cell lines */
-function columnsOf(lines) {
-  const spans = [];
-  for (const L of lines) if (L.cells.length > 1) for (const c of L.cells) spans.push([c.x, c.x2]);
-  if (!spans.length) return [];
-  spans.sort((a, b) => a[0] - b[0]);
-  const cols = [];
-  for (const s of spans) {
-    const last = cols[cols.length - 1];
-    if (last && s[0] <= last[1] + 2) last[1] = Math.max(last[1], s[1]); else cols.push([s[0], s[1]]);
-  }
-  return cols;
-}
-function colIndex(cols, c) {
-  let best = 0, bestOv = -Infinity;
-  cols.forEach((k, i) => {
-    const ov = Math.min(k[1], c.x2) - Math.max(k[0], c.x);
-    const d = ov > 0 ? ov : -Math.min(Math.abs(c.x - k[0]), Math.abs(c.x - k[1]));
-    if (d > bestOv) { bestOv = d; best = i; }
-  });
-  return best;
-}
-function linesToGrid(lines) {
-  const cols = columnsOf(lines);
-  return lines.map(L => {
-    if (!cols.length) return [L.text.replace(/\t/g, ' ')];
-    const row = [];
-    for (const c of L.cells) {
-      const i = colIndex(cols, c);
-      row[i] = row[i] ? row[i] + ' ' + c.text : c.text;
-    }
-    for (let i = 0; i < row.length; i++) if (row[i] == null) row[i] = '';
-    return row;
-  });
-}
-/* Blocks for documents: paragraphs and tables */
-function pageBlocks(pm) {
-  const lines = pm.lines; if (!lines.length) return [];
-  const body = median(lines.flatMap(L => L.items.map(() => L.size))) || 11;
-  const blocks = [];
-  let i = 0;
-  while (i < lines.length) {
-    // table: >= 3 consecutive lines with >= 2 cells
-    let j = i;
-    while (j < lines.length && lines[j].cells.length >= 2) j++;
-    if (j - i >= 3) { blocks.push({ type: 'table', rows: linesToGrid(lines.slice(i, j)), size: body }); i = j; continue; }
-    const L = lines[i];
-    const prev = blocks[blocks.length - 1];
-    const prevLine = i > 0 ? lines[i - 1] : null;
-    const text = L.cells.map(c => c.text).join('    ');
-    const isHead = L.size >= body * 1.25;
-    let join = prev && prev.type === 'p' && prevLine && !prev.head && !isHead &&
-      (L.top - prevLine.bottom) < Math.max(L.size, prevLine.size) * 0.9 &&
-      Math.abs(L.size - prevLine.size) < body * 0.2 &&
-      !(/[.:!?。！？]$/.test(prev.text) && prevLine.right < pm.w * 0.7) &&
-      !/^([•\-–▪●◦*]|\d+[.)]|[a-z][.)])\s/.test(text);
-    if (prev && prev.head && isHead && prevLine && (L.top - prevLine.bottom) < L.size * 0.6 && Math.abs(L.size - prevLine.size) < 1) join = true;
-    if (join) {
-      prev.text = /[-‐]$/.test(prev.text) && /^[a-z]/.test(text) ? prev.text.slice(0, -1) + text : prev.text + ' ' + text;
-      prev.right = Math.max(prev.right, L.right); prev.nlines++;
-    } else {
-      blocks.push({ type: 'p', text, size: L.size, head: isHead ? (L.size >= body * 1.6 ? 1 : 2) : 0, x: L.x, right: L.right, nlines: 1, gapBefore: prevLine ? L.top - prevLine.bottom : 0 });
-    }
-    i++;
-  }
-  for (const b of blocks) if (b.type === 'p') {
-    const cx = (b.x + b.right) / 2;
-    b.center = b.nlines === 1 && Math.abs(cx - pm.w / 2) < pm.w * 0.06 && (b.right - b.x) < pm.w * 0.7 && b.x > pm.w * 0.15;
-    b.indent = Math.max(0, b.x - (pm.marginL || 0));
-  }
-  return blocks;
-}
+const buildLines = items => Engine.buildLines(items);
+const linesToGrid = lines => Engine.grid(lines).rows;
 function pagesToText(pages) {
-  return pages.map(pm => {
-    const t = pageBlocks(pm).map(b => b.type === 'table' ? b.rows.map(r => r.join('\t')).join('\n') : b.text).join('\n\n');
+  return pages.filter(pm => pm.kind !== 'blank').map(pm => {
+    let t;
+    if (pm.kind === 'picture') t = '[picture page – no text]';
+    else t = Engine.layout({ ...pm, images: [] }).map(b => b.type === 'table' ? b.rows.map(r => r.join('\t')).join('\n') : b.list === 'bullet' ? '• ' + b.text : b.cells ? b.cells.map(c => c.text).join('\t') : b.text).join('\n\n');
     return pages.length > 1 ? `----- Page ${pm.n} -----\n${t}` : t;
   }).join('\n\n');
 }
 
 /* ---------------- writers ---------------- */
-async function writeDocx(pages, mode) {
+async function writeDocx(pages, mode, hf = {}) {
   const D = await lib.docx();
   const sections = [];
+  const M = 36; // page margin in pt (0.5 in)
+  const tw = pt => Math.round(pt * 20);
+  const run = (text, o = {}) => new D.TextRun({ text, size: Math.round(o.size * 2), bold: o.bold || undefined, italics: o.italic || undefined, color: o.color });
+  const pngOrJpg = async cv => ({ type: 'jpg', data: await canvasBytes(cv, 'image/jpeg', 0.88) });
+  const header = hf.headerText ? { default: new D.Header({ children: [new D.Paragraph({ alignment: D.AlignmentType.RIGHT, children: [run(hf.headerText, { size: 8, color: '666666' })] })] }) } : undefined;
+  const footer = hf.footerText ? { default: new D.Footer({ children: [new D.Paragraph({ alignment: D.AlignmentType.CENTER, children: [run(hf.footerText, { size: 8, color: '666666' })] })] }) } : undefined;
   for (const pm of pages) {
-    pm.marginL = Math.min(...pm.lines.map(l => l.x), pm.w * 0.1);
+    if (pm.kind === 'blank') continue;
+    const pw = pm.w, ph = pm.h, cw = pw - 2 * M, ch = ph - 2 * M - (header ? 18 : 0) - (footer ? 18 : 0);
     const children = [];
-    const margin = 720; // twips (0.5 in)
-    const pageWtw = Math.round(pm.w * 20), pageHtw = Math.round(pm.h * 20);
-    if (mode !== 'text' && pm.cv) {
-      const jpg = await canvasBytes(pm.cv, 'image/jpeg', 0.85);
-      const maxWpx = (pageWtw - 2 * margin) / 15, maxHpx = (pageHtw - 2 * margin) / 15 - 4;
-      const s = Math.min(maxWpx / pm.cv.width, maxHpx / pm.cv.height);
-      children.push(new D.Paragraph({ children: [new D.ImageRun({ type: 'jpg', data: jpg, transformation: { width: Math.round(pm.cv.width * s), height: Math.round(pm.cv.height * s) } })] }));
+    const picture = async (cv, wPt, hPt, align) => {
+      const k = Math.min(1, cw / wPt, ch / hPt);
+      const im = await pngOrJpg(cv);
+      return new D.Paragraph({ alignment: align, children: [new D.ImageRun({ ...im, transformation: { width: Math.round(wPt * k * 96 / 72), height: Math.round(hPt * k * 96 / 72) } })] });
+    };
+    if (pm.kind === 'picture' || (mode !== 'text' && pm.cv)) {
+      const cv = pm.cv; if (cv) children.push(await picture(cv, pw, ph * 0 + cv.height * pw / cv.width, D.AlignmentType.CENTER));
     }
-    if (mode !== 'image') {
+    if (pm.kind !== 'picture' && mode !== 'image') {
       if (mode === 'both' && pm.cv) children.push(new D.Paragraph({ children: [new D.PageBreak()] }));
-      for (const b of pageBlocks(pm)) {
+      const blocks = Engine.layout(pm);
+      const s = Engine.fitScale(blocks, pm, cw, ch);
+      const base = Engine.bodySize(pm); const body = base * s;
+      for (const b of blocks) {
+        if (b.type === 'image') {
+          const cx = b.x + b.w / 2;
+          const al = cx < pw * 0.38 ? D.AlignmentType.LEFT : cx > pw * 0.62 ? D.AlignmentType.RIGHT : D.AlignmentType.CENTER;
+          const iw = Math.min(b.w, cw) * s; children.push(await picture(b.cv, iw, iw * b.h / b.w, al));
+          continue;
+        }
         if (b.type === 'table') {
           const ncol = Math.max(...b.rows.map(r => r.length));
-          const fs = Math.round(Math.min(22, Math.max(16, b.size * 2)));
+          const fs = base * 0.92 * s;
+          const xs = (b.colX || []).concat([pw - M]);
+          const widths = Array.from({ length: ncol }, (_, k) => Math.max(400, tw((xs[k + 1] || pw - M) - (xs[k] || M))));
+          const headerRow = b.rows.length > 2 && b.rows[0].every(c => !c || !/\d{2}/.test(c));
           children.push(new D.Table({
-            width: { size: 100, type: D.WidthType.PERCENTAGE },
-            rows: b.rows.map(r => new D.TableRow({
+            width: { size: 100, type: D.WidthType.PERCENTAGE }, columnWidths: widths,
+            rows: b.rows.map((r, ri) => new D.TableRow({
+              tableHeader: ri === 0 && headerRow,
               children: Array.from({ length: ncol }, (_, k) => new D.TableCell({
-                children: [new D.Paragraph({ children: [new D.TextRun({ text: r[k] || '', size: fs })] })]
+                shading: ri === 0 && headerRow ? { fill: 'E8EEF8' } : undefined,
+                margins: { top: 40, bottom: 40, left: 80, right: 80 },
+                children: [new D.Paragraph({ children: [run(r[k] || '', { size: fs, bold: ri === 0 && headerRow })] })]
               }))
             }))
           }));
-          children.push(new D.Paragraph({ children: [] }));
-        } else {
-          const size = Math.round(Math.min(48, Math.max(16, b.size * 2)));
-          children.push(new D.Paragraph({
-            heading: b.head === 1 ? D.HeadingLevel.HEADING_1 : b.head === 2 ? D.HeadingLevel.HEADING_2 : undefined,
-            alignment: b.center ? D.AlignmentType.CENTER : undefined,
-            indent: !b.center && b.indent > 20 ? { left: Math.round(Math.min(b.indent, pm.w * 0.4) * 20) } : undefined,
-            spacing: { after: 120 },
-            children: [new D.TextRun({ text: b.text, size, bold: b.head ? true : undefined, color: b.head ? '000000' : undefined })]
-          }));
+          children.push(new D.Paragraph({ spacing: { after: 60 }, children: [] }));
+          continue;
         }
+        // paragraph
+        const size = b.head === 1 ? base * 1.45 * s : b.head === 2 ? base * 1.18 * s : body;
+        const bold = !!(b.head || b.caps);
+        let runs;
+        if (b.cells && b.cells.length > 1) {
+          runs = [];
+          b.cells.forEach((c, k) => {
+            if (k) runs.push(new D.TextRun({ text: '\t', size: Math.round(size * 2) }));
+            const m = c.text.match(/^([\p{Lu}][\p{L}\p{N} .\/&()'’-]{1,38}?)\s*[:：]\s*/u);
+            if (m && m[0].length < c.text.length) runs.push(run(m[0], { size, bold: true }), run(c.text.slice(m[0].length), { size, bold }));
+            else runs.push(run(c.text, { size, bold }));
+          });
+        } else if (b.label) {
+          runs = [run(b.text.slice(0, b.label), { size, bold: true })];
+          if (b.label < b.text.length) runs.push(run(b.text.slice(b.label), { size, bold }));
+        } else runs = [run(b.text, { size, bold })];
+        const tabStops = b.cells && b.cells.length > 1 ? b.cells.slice(1).map(c => ({ type: D.TabStopType.LEFT, position: Math.min(tw(cw - 20), Math.max(tw(30), tw(c.x - M))) })) : undefined;
+        const para = {
+          children: runs, tabStops,
+          heading: b.head === 1 ? D.HeadingLevel.HEADING_1 : b.head === 2 ? D.HeadingLevel.HEADING_2 : undefined,
+          alignment: b.center ? D.AlignmentType.CENTER : undefined,
+          spacing: { after: Math.round(100 * s), before: b.head ? Math.round(120 * s) : 0, line: 240, lineRule: D.LineRuleType ? D.LineRuleType.AUTO : undefined }
+        };
+        if (b.list === 'bullet') para.bullet = { level: 0 };
+        else if (b.list === 'num') para.indent = { left: 400 + (b.indent > 10 ? tw(Math.min(b.indent, 150)) : 0), hanging: 400 };
+        else if (!b.center && b.indent > 14) para.indent = { left: tw(Math.min(b.indent, 200)) };
+        children.push(new D.Paragraph(para));
       }
-      if (!children.length) children.push(new D.Paragraph({ children: [] }));
     }
-    sections.push({ properties: { page: { size: { width: pageWtw, height: pageHtw }, margin: { top: margin, bottom: margin, left: margin, right: margin } } }, children });
+    if (!children.length) children.push(new D.Paragraph({ children: [] }));
+    sections.push({ properties: { page: { size: { width: tw(pw), height: tw(ph) }, margin: { top: tw(M), bottom: tw(M), left: tw(M), right: tw(M), header: tw(18), footer: tw(18) } } }, headers: header, footers: footer, children });
   }
-  const doc = new D.Document({ creator: 'DocConvert', styles: { default: { document: { run: { font: 'Calibri' } } } }, sections });
+  if (!sections.length) sections.push({ children: [new D.Paragraph({ children: [run('(no text found)', { size: 11 })] })] });
+  const doc = new D.Document({
+    creator: 'DocConvert',
+    styles: { default: { document: { run: { font: 'Calibri', size: 22 } } }, paragraphStyles: [
+      { id: 'Heading1', name: 'Heading 1', basedOn: 'Normal', next: 'Normal', quickFormat: true, run: { bold: true, size: 32, color: '1F3A68' } },
+      { id: 'Heading2', name: 'Heading 2', basedOn: 'Normal', next: 'Normal', quickFormat: true, run: { bold: true, size: 26, color: '1F3A68' } }] },
+    sections
+  });
   return D.Packer.toBlob(doc);
 }
 function toNumber(s) {
@@ -540,6 +499,43 @@ async function buildImagePdf(imgPages, ocr, label = 'Building PDF') {
   }
   return new Blob([await doc.save()], { type: 'application/pdf' });
 }
+/* photos/scans → PDF through the quality engine (straighten, clean, OCR text layer) */
+async function buildScanPdf(cvs, place, { ocr, photo, allowSplit, label = 'Building PDF' }) {
+  const PL = await lib.pdflib();
+  const doc = await PL.PDFDocument.create();
+  for (let i = 0; i < cvs.length; i++) {
+    const base = 0.08 + 0.88 * i / cvs.length;
+    prog(`${label}: page ${i + 1} of ${cvs.length} – ${ocr ? 'repairing and reading' : 'adding'}…`, base);
+    let parts;
+    if (ocr) parts = await Engine.processScanned(cvs[i], { langs: ocrLangs, pageNo: i + 1, photo, allowSplit, wantPdf: true, targetW: 2400 });
+    else parts = [{ display: cvs[i], kind: 'text' }];
+    for (const pm of parts) {
+      if (pm.kind === 'blank') continue;
+      const p = place(shrink(pm.display, 2400));
+      const page = doc.addPage([p.pw, p.ph]);
+      const r = p.rect || { x: 0, y: 0, w: p.pw, h: p.ph };
+      page.drawImage(await doc.embedJpg(await canvasBytes(p.cv, 'image/jpeg', 0.86)), { x: r.x, y: r.y, width: r.w, height: r.h });
+      if (pm.textPdf && pm.kind === 'text') { const [emb] = await doc.embedPdf(pm.textPdf, [0]); page.drawPage(emb, { x: r.x, y: r.y, width: r.w, height: r.h }); }
+    }
+  }
+  if (!doc.getPageCount()) throw new Error('All pages were blank.');
+  return new Blob([await doc.save()], { type: 'application/pdf' });
+}
+/* scans → page models for Word/Text */
+async function scansToPages(cvs, wantRegions) {
+  const pages = [];
+  for (let i = 0; i < cvs.length; i++) {
+    prog(`Page ${i + 1} of ${cvs.length}: repairing and reading…`, 0.08 + 0.85 * i / cvs.length);
+    const pms = await Engine.processScanned(cvs[i], { langs: ocrLangs, pageNo: i + 1, photo: false, allowSplit: true, ptW: 595.28, ptH: 841.89, wantRegions, targetW: 2400 });
+    for (const pm of pms) {
+      pm.lines = pm.kind === 'text' ? Engine.buildLines(pm.items, pm.w) : [];
+      pm.rules = pm.kind === 'text' ? Engine.rulings(pm.display, pm.display.width / pm.w) : [];
+      if (pm.kind === 'picture') pm.cv = shrink(pm.display, 2000);
+      pm.display = null; pages.push(pm);
+    }
+  }
+  return pages;
+}
 const PAGE = { a4: [595.28, 841.89], letter: [612, 792] };
 /* place an image canvas on a page; returns {cv,pw,ph,rect} */
 function placeOnPage(cv, size, orient, margin = 0) {
@@ -591,15 +587,19 @@ $('#fromGo').onclick = () => run(async () => {
   if (!nums.length) throw new Error('No valid pages chosen. Example: 1-3,5');
   const name = baseName(fromFile.name);
   const ocr = $('#fromOcr').checked;
+  Engine.resetReport();
   let files = [], hint = '';
   if (fromFmt === 'docx') {
     const mode = $('#o_docx').value;
-    const pages = await readPdfPages(pdf, nums, { ocr: ocr && mode !== 'image', needImage: mode !== 'text', imgMax: 1800 });
-    prog('Writing Word file…', 0.93);
-    files = [{ name: name + '.docx', blob: await writeDocx(pages, mode) }];
+    const pages = await readPdfPages(pdf, nums, { ocr: ocr && mode !== 'image', needImage: mode !== 'text', imgMax: 1800, regions: mode !== 'image' });
+    prog('Checking layout…', 0.92);
+    const hf = mode !== 'image' ? Engine.headersFooters(pages) : {};
+    prog('Writing Word file…', 0.95);
+    files = [{ name: name + '.docx', blob: await writeDocx(pages, mode, hf) }];
     hint = ocrHint(pages);
   } else if (fromFmt === 'xlsx') {
     const pages = await readPdfPages(pdf, nums, { ocr, needImage: false });
+    Engine.headersFooters(pages);
     prog('Writing Excel file…', 0.93);
     files = [{ name: name + '.xlsx', blob: await writeXlsx(pages, $('#o_xlsx').value === 'one') }];
     hint = ocrHint(pages) + ' Columns are detected from the text positions; check merged cells.';
@@ -611,6 +611,7 @@ $('#fromGo').onclick = () => run(async () => {
     hint = mode === 'image' ? 'Each page is one slide; the page text is in the speaker notes.' : ocrHint(pages);
   } else if (fromFmt === 'txt') {
     const pages = await readPdfPages(pdf, nums, { ocr, needImage: false });
+    Engine.headersFooters(pages);
     files = [{ name: name + '.txt', blob: new Blob([pagesToText(pages)], { type: 'text/plain;charset=utf-8' }) }];
     hint = ocrHint(pages);
   } else if (fromFmt === 'jpg') {
@@ -637,27 +638,28 @@ $('#fromGo').onclick = () => run(async () => {
       const page = await pdf.getPage(n);
       const t = await pageTextItems(page);
       const chars = t.items.reduce((s, i) => s + i.str.trim().length, 0);
-      if (chars >= 20) { const [cp] = await doc.copyPages(src, [n - 1]); doc.addPage(cp); continue; }
-      prog(`OCR on page ${n} of ${pdf.numPages}…`, null);
-      const { cv } = await renderPage(page, 2400);
-      const res = await ocrCanvas(cv, true);
-      const np = doc.addPage([t.w, t.h]);
-      np.drawImage(await doc.embedJpg(await canvasBytes(cv, 'image/jpeg', 0.85)), { x: 0, y: 0, width: t.w, height: t.h });
-      if (res.textPdf) { const [emb] = await doc.embedPdf(res.textPdf, [0]); np.drawPage(emb, { x: 0, y: 0, width: t.w, height: t.h }); }
+      if (chars >= 20 && !Engine.garbled(t.items)) { const [cp] = await doc.copyPages(src, [n - 1]); doc.addPage(cp); continue; }
+      if (chars >= 20) Engine.note('garbled');
+      prog(`Page ${n}: repairing and reading…`, null);
+      const { cv } = await renderPage(page, 3400, Math.min(4, 2400 / t.w));
+      const pms = await Engine.processScanned(cv, { langs: ocrLangs, pageNo: n, photo: true, allowSplit: t.w > t.h * 1.15, ptW: t.w, ptH: t.h, wantPdf: true, targetW: 2400, lowRes: false });
+      for (const pm of pms) {
+        const pw = pm.w, ph = pm.h;
+        const np = doc.addPage([pw, ph]);
+        np.drawImage(await doc.embedJpg(await canvasBytes(shrink(pm.display, 2200), 'image/jpeg', 0.85)), { x: 0, y: 0, width: pw, height: ph });
+        if (pm.textPdf && pm.kind === 'text') { const [emb] = await doc.embedPdf(pm.textPdf, [0]); np.drawPage(emb, { x: 0, y: 0, width: pw, height: ph }); }
+      }
       nocr++; page.cleanup();
     }
     files = [{ name: name + '_searchable.pdf', blob: new Blob([await doc.save()], { type: 'application/pdf' }) }];
     hint = nocr ? `${nocr} page(s) read with OCR in ${ocrLangs.map(langName).join(' + ')}.` : 'All pages already had text, so nothing needed OCR.';
   }
   prog('Done', 1);
-  showResult(files, hint.trim());
+  showResult(files, hint.trim(), true);
 });
 function ocrHint(pages) {
-  const n = pages.filter(p => p.ocr).length;
-  const empty = pages.filter(p => !p.lines.length).length;
-  let h = n ? `${n} scanned page(s) read with OCR (${ocrLangs.map(langName).join(' + ')}).` : '';
-  if (empty && !$('#fromOcr').checked) h += ` ${empty} page(s) had no text – turn on OCR for scanned pages.`;
-  return h;
+  const empty = pages.filter(p => p.kind === 'empty').length;
+  return empty && !$('#fromOcr').checked ? `${empty} page(s) had no text – turn on OCR for scanned pages.` : '';
 }
 
 /* =============== TO PDF =============== */
@@ -687,6 +689,7 @@ const kindOf = f => {
   return 'unknown';
 };
 $('#toGo').onclick = () => run(async () => {
+  Engine.resetReport();
   const size = $('#toSize').value, orient = $('#toOrient').value, ocr = $('#toOcr').checked;
   const files = [];
   const imgs = toFiles.filter(f => kindOf(f) === 'img');
@@ -695,7 +698,7 @@ $('#toGo').onclick = () => run(async () => {
     const pages = [];
     for (let i = 0; i < imgs.length; i++) { prog(`Reading image ${i + 1} of ${imgs.length}…`, 0.05 + 0.2 * i / imgs.length); pages.push(placeOnPage(await loadImageFile(imgs[i]), size, orient, size === 'fit' ? 0 : 18)); }
     const name = imgs.length === 1 ? baseName(imgs[0].name) : 'images_' + new Date().toISOString().slice(0, 10);
-    files.push({ name: name + '.pdf', blob: await buildImagePdf(pages, ocr) });
+    files.push({ name: name + '.pdf', blob: ocr ? await buildScanPdf(pages.map(p => p.cv), cv => placeOnPage(cv, size, orient, size === 'fit' ? 0 : 18), { ocr: true, photo: true, allowSplit: true }) : await buildImagePdf(pages, false) });
   }
   for (const f of others) {
     const k = kindOf(f);
@@ -716,7 +719,7 @@ $('#toGo').onclick = () => run(async () => {
     files.push({ name: baseName(f.name) + '.pdf', blob });
   }
   prog('Done', 1);
-  showResult(files, ocr ? 'Text layer added with OCR, so you can search and copy text.' : '');
+  showResult(files, ocr ? 'Text layer added with OCR, so you can search and copy text.' : '', ocr);
 });
 
 /* hidden render stage */
@@ -1085,32 +1088,26 @@ window.addEventListener('resize', () => { if ($('#cropModal').classList.contains
 $('#scanGo').onclick = () => run(async () => {
   const name = 'scan_' + new Date().toISOString().slice(0, 16).replace(/[-:T]/g, '');
   const size = $('#scanSize').value;
+  Engine.resetReport();
   let files = [], hint = '';
+  const cvs = scanPages.map(p => p.out);
   if (scanFmt === 'pdf') {
     const ocr = $('#scanOcr').checked;
-    const pages = scanPages.map(p => placeOnPage(p.out, size, 'auto', size === 'fit' ? 0 : 14));
-    files = [{ name: name + '.pdf', blob: await buildImagePdf(pages, ocr, 'Building PDF') }];
-    hint = ocr ? 'Searchable PDF – text read with OCR in ' + ocrLangs.map(langName).join(' + ') + '.' : '';
+    files = [{ name: name + '.pdf', blob: await buildScanPdf(cvs, cv => placeOnPage(cv, size, 'auto', size === 'fit' ? 0 : 14), { ocr, photo: false, allowSplit: false }) }];
+    hint = ocr ? 'Searchable PDF – you can search and copy the text.' : '';
   } else if (scanFmt === 'jpg') {
     const ents = [];
-    for (let i = 0; i < scanPages.length; i++) ents.push({ name: `${name}_p${i + 1}.jpg`, blob: await canvasBlob(scanPages[i].out, 'image/jpeg', 0.9) });
+    for (let i = 0; i < cvs.length; i++) ents.push({ name: `${name}_p${i + 1}.jpg`, blob: await canvasBlob(cvs[i], 'image/jpeg', 0.9) });
     files = await zipOrSingle(ents, name + '_images.zip');
   } else {
-    const pages = [];
-    for (let i = 0; i < scanPages.length; i++) {
-      prog(`OCR on page ${i + 1} of ${scanPages.length}…`, 0.1 + 0.8 * i / scanPages.length);
-      const cv = scanPages[i].out; const r = await ocrCanvas(cv, false);
-      const s = 72 / 150; // treat scans as 150 dpi
-      const items = r.items.map(it => ({ ...it, x: it.x * s, top: it.top * s, w: it.w * s, h: it.h * s, size: Math.min(14, it.size * s) }));
-      pages.push({ n: i + 1, w: cv.width * s, h: cv.height * s, items, lines: buildLines(items), ocr: true });
-    }
+    const pages = await scansToPages(cvs, scanFmt === 'docx');
+    const hf = Engine.headersFooters(pages);
     prog('Writing file…', 0.95);
-    if (scanFmt === 'docx') files = [{ name: name + '.docx', blob: await writeDocx(pages.map(p => ({ ...p, w: 595.28, h: p.h * 595.28 / p.w, _sw: p.w })).map(fixScale), 'text') }];
+    if (scanFmt === 'docx') files = [{ name: name + '.docx', blob: await writeDocx(pages, 'text', hf) }];
     else files = [{ name: name + '.txt', blob: new Blob([pagesToText(pages)], { type: 'text/plain;charset=utf-8' }) }];
-    hint = 'Text read with OCR in ' + ocrLangs.map(langName).join(' + ') + '. Check it for errors.';
   }
   prog('Done', 1);
-  showResult(files, hint);
+  showResult(files, hint, scanFmt !== 'jpg');
 });
 /* rescale OCR page model to A4 width for Word */
 function fixScale(p) {
@@ -1134,4 +1131,4 @@ for (const [id, fn] of [['#fromDrop', fl => setFromFile(fl[0])], ['#toDrop', fl 
   el.addEventListener('dragover', e => { e.preventDefault(); el.classList.add('has'); });
   el.addEventListener('drop', e => { e.preventDefault(); fn(e.dataTransfer.files); });
 }
-window.DC = { readPdfPages, openPdf, buildLines, pageBlocks, linesToGrid, ocrCanvas, getOcr }; // for testing
+window.DC = { readPdfPages, openPdf, buildLines, linesToGrid, ocrCanvas, getOcr }; // for testing
