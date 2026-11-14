@@ -40,7 +40,8 @@ const Engine = (() => {
     pageNums: n => `Removed ${n} page-number line(s) from the text`,
     columns: n => `Read ${n} two-column page(s) in the right order`,
     lists: n => `Rebuilt ${n} list item(s)`,
-    faithful: n => `Kept the original look for ${n} page(s) (forms, bills, receipts, cards) with the text editable in place`,
+    exactPages: n => `Kept ${n} photographed page(s) exactly as the original – the text is hidden behind the picture so you can search and copy it`,
+    faithful: n => `Kept the original look for ${n} page(s) with the clearly read words made editable in place`,
     flowPages: n => `Rebuilt ${n} page(s) as flowing, editable text`,
     fit: n => `Adjusted text size so ${n} page(s) fit on one page each`
   };
@@ -481,7 +482,7 @@ const Engine = (() => {
       const lh = l.bbox.y1 - l.bbox.y0, tall = lh > l.rowH * 2.2;
       for (const w of l.words) {
         const y0 = tall ? w.y0 : l.bbox.y0, h = tall ? (w.y1 - w.y0) * 1.25 : lh, sz = tall ? (w.y1 - w.y0) * 1.1 : lh; // line box height ≈ font size (calibrated)
-        items.push({ x: w.x0 / pxPerPt, top: y0 / pxPerPt, w: (w.x1 - w.x0) / pxPerPt, h: h / pxPerPt, size: Math.max(5, sz / pxPerPt), str: fixToken(w.t, w.conf), conf: w.conf, para: l.para, ocr: true, li, src: w });
+        items.push({ x: w.x0 / pxPerPt, top: y0 / pxPerPt, w: (w.x1 - w.x0) / pxPerPt, h: h / pxPerPt, size: Math.max(5, sz / pxPerPt), str: fixToken(w.t, w.conf), conf: w.conf, para: l.para, ocr: true, li, src: w, wy0: w.y0 / pxPerPt, wh: (w.y1 - w.y0) / pxPerPt });
       }
     });
     return items;
@@ -764,7 +765,7 @@ const Engine = (() => {
     const lines = [];
     for (const it of its) {
       let ln = null;
-      for (let j = lines.length - 1; j >= 0 && j >= lines.length - 4; j--) { const L = lines[j]; if (Math.abs(L.cy - it.cy) < Math.min(L.size, it.size) * 0.55) { ln = L; break; } }
+      for (let j = lines.length - 1; j >= 0 && j >= lines.length - 4; j--) { const L = lines[j]; if (Math.abs(L.cy - it.cy) < Math.min(L.size, it.size) * (it.ocr ? 0.4 : 0.55)) { ln = L; break; } }
       if (!ln) { ln = { items: [], cy: it.cy, size: it.size }; lines.push(ln); }
       ln.items.push(it); ln.cy = ln.items.reduce((s, i) => s + i.cy, 0) / ln.items.length; ln.size = median(ln.items.map(i => i.size));
     }
@@ -774,9 +775,9 @@ const Engine = (() => {
       L.x = L.items[0].x; L.right = Math.max(...L.items.map(i => i.x + i.w));
       const cells = []; let cur = null;
       for (const it of L.items) {
-        const gap = cur ? it.x - cur.x2 : Infinity; const big = Math.max(L.size * 1.6, 12);
+        const gap = cur ? it.x - cur.x2 : Infinity; const big = it.ocr ? Math.max(L.size * 1.15, 10) : Math.max(L.size * 1.6, 12);
         if (!cur || gap > big) { cur = { x: it.x, x2: it.x + it.w, text: it.str }; cells.push(cur); }
-        else { const sp = gap > L.size * 0.12 && !/\s$/.test(cur.text) && !/^\s/.test(it.str); cur.text += (sp ? ' ' : '') + it.str; cur.x2 = Math.max(cur.x2, it.x + it.w); }
+        else { const sp = (it.ocr || gap > L.size * 0.12) && !/\s$/.test(cur.text) && !/^\s/.test(it.str); cur.text += (sp ? ' ' : '') + it.str; cur.x2 = Math.max(cur.x2, it.x + it.w); }
       }
       for (const c of cells) c.text = c.text.replace(/\s+/g, ' ').replace(/\s+([,.;:!?%)])/g, '$1').trim();
       L.cells = cells.filter(c => c.text);
@@ -967,10 +968,17 @@ const Engine = (() => {
     if (rules >= 4) why.push('ruled boxes'); if (multi > 0.3) why.push('columns of values'); if (lost > 0.2) why.push('stamps/handwriting/marks');
     if (numeric > 0.3) why.push('mostly numbers'); if (n < 6) why.push('few lines'); if (longFrac < 0.35) why.push('short fields');
     if (!why.length) { const s2 = fitScale(layout(pm), pm, pm.w - 72, pm.h - 72); if (s2 < 0.8) why.push('too much text to reflow'); }
-    pm.mode = why.length ? 'faithful' : 'flow'; pm.modeWhy = why;
-    note(pm.mode === 'faithful' ? 'faithful' : 'flowPages');
+    // reading confidence decides whether text may replace the original at all
+    const conf = pm.conf || 0;
+    const sure = (pm.items || []).filter(i => (i.conf || 0) >= 90).length / Math.max(1, (pm.items || []).length);
+    // photographed/scanned pages keep their exact look unless they are clean, simple running text
+    if (pm.ocr && (conf < 90 || sure < 0.8 || lost > 0.25 || why.length)) pm.mode = 'exact';
+    else pm.mode = why.length ? 'faithful' : 'flow';
+    pm.modeWhy = why;
+    note(pm.mode === 'exact' ? 'exactPages' : pm.mode === 'faithful' ? 'faithful' : 'flowPages');
     if (typeof Learn !== 'undefined' && pm.sig) Learn.rememberLayout(pm.sig, { mode: pm.mode });
     if (pm.mode === 'faithful') prepareFaithful(pm);
+    if (pm.mode === 'exact') { const sc = Math.min(1, 1600 / pm.display.width); pm.bg = scaled(pm.display, pm.display.width * sc, pm.display.height * sc); }
     return pm.mode;
   }
   /* background with the recognised text erased + the colour of each word */
@@ -981,6 +989,8 @@ const Engine = (() => {
     const k = bg.width / pm.w;
     const lum = i => d[i] * 0.3 + d[i + 1] * 0.59 + d[i + 2] * 0.11;
     for (const it of pm.items || []) {
+      it.replace = (it.conf || 0) >= 90 && it.str.length >= 1;
+      if (!it.replace) continue; // unsure words stay as the original picture
       const x0 = Math.max(0, Math.floor(it.x * k) - 2), y0 = Math.max(0, Math.floor(it.top * k) - 2), x1 = Math.min(W - 1, Math.ceil((it.x + it.w) * k) + 2), y1 = Math.min(H - 1, Math.ceil((it.top + it.h) * k) + 2);
       if (x1 <= x0 || y1 <= y0) continue;
       // ring around the word = paper colour there

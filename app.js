@@ -450,28 +450,37 @@ function pagesToText(pages) {
 /* ---------------- writers ---------------- */
 /* faithful page: cleaned page picture behind, editable text placed exactly where it was printed */
 async function faithfulPage(D, pm) {
-  // everything hangs on ONE paragraph: the page picture behind, and one text box per piece of text on top
+  // ONE paragraph per page. exact: the original picture in front, the read text hidden behind it (search/copy).
+  // faithful: cleaned picture behind, each clearly read word placed in front at its own position.
+  const exact = pm.mode === 'exact';
   const emu = pt => Math.round(pt * 12700), px = pt => Math.max(1, Math.round(pt * 96 / 72));
-  const page = { horizontalPosition: { relative: D.HorizontalPositionRelativeFrom.PAGE, offset: 0 }, verticalPosition: { relative: D.VerticalPositionRelativeFrom.PAGE, offset: 0 } };
-  const runs = [new D.ImageRun({ type: 'jpg', data: await canvasBytes(pm.bg, 'image/jpeg', 0.85), transformation: { width: px(pm.w), height: px(pm.h) }, floating: { ...page, behindDocument: true, allowOverlap: true } })];
+  const pagePos = { horizontalPosition: { relative: D.HorizontalPositionRelativeFrom.PAGE, offset: 0 }, verticalPosition: { relative: D.VerticalPositionRelativeFrom.PAGE, offset: 0 } };
+  const runs = [];
+  const picture = new D.ImageRun({ type: 'jpg', data: await canvasBytes(pm.bg, 'image/jpeg', exact ? 0.8 : 0.85), transformation: { width: px(pm.w), height: px(pm.h) }, floating: { ...pagePos, behindDocument: !exact, allowOverlap: true, zIndex: exact ? 10 : 0 } });
+  const box = (text, x, top, w, size, color, behind) => new D.WpsShapeRun({
+    type: 'wps', transformation: { width: px(w), height: px(size * 1.45) },
+    floating: { horizontalPosition: { relative: D.HorizontalPositionRelativeFrom.PAGE, offset: emu(x) }, verticalPosition: { relative: D.VerticalPositionRelativeFrom.PAGE, offset: emu(top) }, allowOverlap: true, behindDocument: behind, wrap: { type: D.TextWrappingType.NONE } },
+    children: [new D.Paragraph({ spacing: { before: 0, after: 0, line: 240 }, children: [new D.TextRun({ text, font: 'Arial', size: Math.round(size * 2), color })] })],
+    bodyProperties: { margins: { top: 0, bottom: 0, left: 0, right: 0 }, noAutoFit: true }
+  });
+  if (exact) {
+    // hidden text: one box per line, behind the picture
+    for (const L of pm.lines) runs.push(box(L.cells.map(c => c.text).join('   '), L.x, L.top, Math.max(20, L.right - L.x) * 1.3 + 20, Math.max(5, Math.min(30, L.size)), '000000', true));
+    runs.push(picture);
+    return [new D.Paragraph({ children: runs })];
+  }
+  runs.push(picture);
   const body = Engine.bodySize(pm);
   for (const L of pm.lines) {
-    for (const c of L.cells) {
-      const its = L.items.filter(i => i.x >= c.x - 1 && i.x <= c.x2 + 1);
-      const col = (its.find(i => i.color) || {}).color || '1a1a1a';
-      let size = Math.abs(L.size - body) < body * 0.22 ? body : L.size; // same-size body lines share one size
-      size = Math.max(5, Math.min(40, size));
-      const boxW = Math.max(4, c.x2 - c.x);
-      measureCtx.font = `${size}px Arial`; let wText = measureCtx.measureText(c.text).width;
-      if (wText > boxW * 1.25) { size = Math.max(5, size * boxW * 1.1 / wText); measureCtx.font = `${size}px Arial`; wText = measureCtx.measureText(c.text).width; }
-      const sp = Math.max(-size * 0.12, Math.min(size * 0.5, (boxW - wText) / Math.max(1, c.text.length)));
-      const top = L.top - size * 0.12;
-      runs.push(new D.WpsShapeRun({
-        type: 'wps', transformation: { width: px(boxW * 1.3 + size), height: px(size * 1.45) },
-        floating: { horizontalPosition: { relative: D.HorizontalPositionRelativeFrom.PAGE, offset: emu(c.x) }, verticalPosition: { relative: D.VerticalPositionRelativeFrom.PAGE, offset: emu(top) }, allowOverlap: true, behindDocument: false, wrap: { type: D.TextWrappingType.NONE } },
-        children: [new D.Paragraph({ spacing: { before: 0, after: 0, line: 240 }, children: [new D.TextRun({ text: c.text, font: 'Arial', size: Math.round(size * 2), color: col, characterSpacing: Math.round(sp * 20) })] })],
-        bodyProperties: { margins: { top: 0, bottom: 0, left: 0, right: 0 }, noAutoFit: true }
-      }));
+    let size = Math.abs(L.size - body) < body * 0.22 ? body : L.size;
+    size = Math.max(5, Math.min(40, size));
+    for (const it of L.items) {
+      if (!it.replace) continue;
+      const wBox = Math.max(2, it.w);
+      measureCtx.font = `${size}px Arial`; let s2 = size; const wText = measureCtx.measureText(it.str).width;
+      if (wText > wBox * 1.15) s2 = Math.max(5, size * wBox * 1.05 / wText);
+      const top = (it.wy0 != null ? it.wy0 + it.wh - s2 * 0.95 : L.top - s2 * 0.12);
+      runs.push(box(it.str, it.x, top, wBox * 1.4 + s2, s2, it.color || '1a1a1a', false));
     }
   }
   return [new D.Paragraph({ children: runs })];
@@ -495,7 +504,7 @@ async function writeDocx(pages, mode, hf = {}) {
       const im = await pngOrJpg(cv);
       return new D.Paragraph({ alignment: align, children: [new D.ImageRun({ ...im, transformation: { width: Math.round(wPt * k * 96 / 72), height: Math.round(hPt * k * 96 / 72) } })] });
     };
-    if (pm.mode === 'faithful' && pm.bg && mode !== 'image') {
+    if ((pm.mode === 'faithful' || pm.mode === 'exact') && pm.bg && mode !== 'image') {
       children.push(...(await faithfulPage(D, pm)));
       sections.push({ properties: { page: { size: { width: tw(pw), height: tw(ph) }, margin: { top: 0, bottom: 0, left: 0, right: 0, header: 0, footer: 0 } } }, children });
       continue;
